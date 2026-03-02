@@ -48,6 +48,14 @@ fastify.get('/', async (request, reply) => {
     reply.send({ message: 'Twilio Media Stream Server is running!' });
 });
 
+fastify.get('/health', async () => {
+    return { ok: true };
+});
+
+fastify.addHook('onRequest', async (request, reply) => {
+    console.log(`[HTTP] ${request.method} ${request.url}`);
+});
+
 // Route for Twilio to handle incoming calls
 // <Say> punctuation to improve text-to-speech translation
 fastify.all('/incoming-call', async (request, reply) => {
