@@ -40,29 +40,31 @@ const VOICE = "alloy";
 const TEMPERATURE = 0.7;
 const PORT = Number(process.env.PORT || 8080);
 
+// --- app routes ---
 fastify.addHook("onRequest", async (request) => {
   console.log(`[HTTP] ${request.method} ${request.url}`);
 });
 
-fastify.get("/", async () => ({ ok: true, service: "twilio-openai-realtime" }));
+fastify.get("/", async () => ({ ok: true }));
 fastify.get("/health", async (_req, reply) => reply.code(200).send("ok"));
 
-// Twilio webhook: FARA Say. Conecteaza direct stream-ul.
+// Twilio webhook: fara <Say> - conectam direct stream-ul
 fastify.all("/incoming-call", async (request, reply) => {
   const wsBase = (PUBLIC_URL ? PUBLIC_URL : `https://${request.headers.host}`)
     .replace(/^http:\/\//, "ws://")
     .replace(/^https:\/\//, "wss://");
 
-  const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <Stream url="${wsBase}/media-stream" />
   </Connect>
 </Response>`;
 
-  reply.type("text/xml").send(twimlResponse);
+  reply.type("text/xml").send(twiml);
 });
 
+// --- Twilio Media Stream WS ---
 fastify.register(async (f) => {
   f.get("/media-stream", { websocket: true }, (connection) => {
     console.log("Client connected (Twilio WS)");
@@ -73,13 +75,24 @@ fastify.register(async (f) => {
     let openAiReady = false;
     let sessionConfigured = false;
 
-    // SUPER IMPORTANT: gating pentru response.create
+    // Raspuns in zbor (OpenAI)
     let responseInFlight = false;
 
-    // Optional: OpenAI vorbeste primul
-    let greetingSent = false;
-    let greetingInFlight = false;
+    // Cand user vorbeste, VAD face committed -> setam pending si raspundem doar cand e safe
+    let pendingResponse = false;
 
+    // Ignoram committed-uri din primele X ms (zgomot/tacere de start)
+    const callStartAt = Date.now();
+    const IGNORE_COMMITTED_MS = 1200;
+
+    // Mic delay dupa response.done inainte sa permitem alt response.create
+    const AFTER_DONE_DELAY_MS = 250;
+
+    // Ca sa nu spamam response.create din greseala
+    let lastResponseCreateAt = 0;
+    const MIN_GAP_BETWEEN_RESPONSES_MS = 400;
+
+    // OpenAI WS
     const openAiWs = new WebSocket(
       `wss://api.openai.com/v1/realtime?model=gpt-realtime`,
       {
@@ -90,8 +103,7 @@ fastify.register(async (f) => {
       }
     );
 
-    function sendSessionUpdate() {
-      // IMPORTANT: schema moderna, fara "session.audio" (care iti dadea unknown_parameter)
+    const sendSessionUpdate = () => {
       const sessionUpdate = {
         type: "session.update",
         session: {
@@ -99,8 +111,6 @@ fastify.register(async (f) => {
           temperature: TEMPERATURE,
           voice: VOICE,
           turn_detection: { type: "server_vad" },
-
-          // Twilio Media Streams payload = PCMU (G.711 u-law)
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
         },
@@ -108,29 +118,36 @@ fastify.register(async (f) => {
 
       console.log("Sending session.update to OpenAI");
       openAiWs.send(JSON.stringify(sessionUpdate));
-    }
+    };
 
-    function requestResponse(modalities = ["audio", "text"]) {
+    const safeCreateResponse = (reason) => {
+      const now = Date.now();
+
       if (openAiWs.readyState !== WebSocket.OPEN) return;
-      if (responseInFlight) return; // ✅ fix: nu cerem alt raspuns daca e deja unul activ
+      if (responseInFlight) return;
+
+      // throttle
+      if (now - lastResponseCreateAt < MIN_GAP_BETWEEN_RESPONSES_MS) return;
+
+      lastResponseCreateAt = now;
+      console.log(`Sending response.create (${reason})`);
 
       openAiWs.send(
         JSON.stringify({
           type: "response.create",
           response: {
-            modalities,
+            modalities: ["audio", "text"],
             temperature: TEMPERATURE,
+            // uneori ajuta sa fie explicit si aici
+            voice: VOICE,
           },
         })
       );
-      // NOTA: responseInFlight devine true pe "response.created"
-    }
+      // responseInFlight devine true pe response.created
+    };
 
-    function sendGreeting() {
-      if (greetingSent) return;
-      greetingSent = true;
-      greetingInFlight = true;
-
+    const greetOnce = () => {
+      // OpenAI vorbeste primul
       const item = {
         type: "conversation.item.create",
         item: {
@@ -146,22 +163,20 @@ fastify.register(async (f) => {
           ],
         },
       };
-
       openAiWs.send(JSON.stringify(item));
-      requestResponse(["audio", "text"]);
-    }
+      safeCreateResponse("greeting");
+    };
 
-    function maybeStart() {
+    const maybeStart = () => {
       if (!openAiReady || !streamSid) return;
       if (sessionConfigured) return;
 
       sessionConfigured = true;
       sendSessionUpdate();
 
-      // OpenAI vorbeste primul (cum ai cerut).
-      // Daca vrei sa NU vorbeasca primul, comenteaza linia urmatoare:
-      sendGreeting();
-    }
+      // greeting
+      greetOnce();
+    };
 
     // OpenAI events
     openAiWs.on("open", () => {
@@ -192,9 +207,9 @@ fastify.register(async (f) => {
 
       if (msg.type === "error") {
         console.error("OPENAI ERROR:", JSON.stringify(msg, null, 2));
-        // daca OpenAI respinge cererea, eliberam gating-ul ca sa nu blocam flow-ul
-        responseInFlight = false;
-        greetingInFlight = false;
+
+        // daca OpenAI ne-a respins pentru active_response, NU mai incercam imediat.
+        // pastram pendingResponse si incercam dupa urmatorul response.done + delay.
         return;
       }
 
@@ -203,6 +218,10 @@ fastify.register(async (f) => {
       }
 
       if (msg.type === "response.output_audio.delta" && msg.delta && streamSid) {
+        // DEBUG: confirma ca vine audio
+        // (daca vezi AUDIO_DELTA in logs dar nu se aude, e problema pe Twilio playback)
+        // Daca NU vezi AUDIO_DELTA, OpenAI nu livreaza audio.
+        console.log("AUDIO_DELTA");
         connection.send(
           JSON.stringify({
             event: "media",
@@ -213,10 +232,16 @@ fastify.register(async (f) => {
       }
 
       if (msg.type === "response.done") {
-        responseInFlight = false;
+        // IMPORTANT: nu eliberam instant; asteptam putin
+        setTimeout(() => {
+          responseInFlight = false;
 
-        // daca asta a fost greeting-ul, de acum raspundem normal la user
-        if (greetingInFlight) greetingInFlight = false;
+          // daca intre timp user a vorbit (pendingResponse), raspundem acum
+          if (pendingResponse) {
+            pendingResponse = false;
+            safeCreateResponse("pending_after_done");
+          }
+        }, AFTER_DONE_DELAY_MS);
 
         if (msg.response?.status === "failed") {
           console.error(
@@ -226,11 +251,18 @@ fastify.register(async (f) => {
         }
       }
 
-      // Cand VAD comite vocea user-ului, cerem raspuns,
-      // DAR NU daca greeting-ul e inca in progress sau deja exista raspuns activ.
       if (msg.type === "input_audio_buffer.committed") {
-        if (greetingInFlight) return;
-        requestResponse(["audio", "text"]);
+        // ignora committed in primele momente ale apelului
+        if (Date.now() - callStartAt < IGNORE_COMMITTED_MS) return;
+
+        // daca e raspuns in flight, doar marcam pending
+        if (responseInFlight) {
+          pendingResponse = true;
+          return;
+        }
+
+        // daca nu e in flight, cerem response
+        safeCreateResponse("vad_committed");
       }
     });
 
@@ -238,7 +270,7 @@ fastify.register(async (f) => {
       console.log("Disconnected from OpenAI Realtime WS");
       openAiReady = false;
       responseInFlight = false;
-      greetingInFlight = false;
+      pendingResponse = false;
     });
 
     openAiWs.on("error", (err) => {
@@ -263,7 +295,6 @@ fastify.register(async (f) => {
           break;
 
         case "media":
-          // forward audio către OpenAI
           if (openAiReady && openAiWs.readyState === WebSocket.OPEN) {
             openAiWs.send(
               JSON.stringify({
@@ -279,7 +310,6 @@ fastify.register(async (f) => {
           break;
 
         default:
-          // connected / mark etc
           break;
       }
     });
@@ -293,6 +323,7 @@ fastify.register(async (f) => {
   });
 });
 
+// start server
 const start = async () => {
   try {
     await fastify.listen({ port: PORT, host: "0.0.0.0" });
@@ -302,7 +333,6 @@ const start = async () => {
     process.exit(1);
   }
 };
-
 start();
 
 process.on("SIGTERM", async () => {
