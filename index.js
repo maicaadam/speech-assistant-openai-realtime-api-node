@@ -83,11 +83,11 @@ fastify.all('/incoming-call', async (request, reply) => {
 
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
-      <Say voice="alice" language="ro-RO">
+      <Say voice="Polly.Carmen" language="ro-RO">
         Bună! Vă rog să așteptați. Vă conectez la agentul virtual al agenției.
       </Say>
       <Pause length="1"/>
-      <Say voice="alice" language="ro-RO">Gata. Puteți vorbi.</Say>
+      <Say voice="Polly.Carmen" language="ro-RO">Gata. Puteți vorbi.</Say>
       <Connect>
         <Stream url="${wsBase}/media-stream" />
       </Connect>
