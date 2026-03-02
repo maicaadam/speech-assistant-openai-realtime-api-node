@@ -40,24 +40,11 @@ const VOICE = "alloy";
 const TEMPERATURE = 0.7;
 const PORT = Number(process.env.PORT || 8080);
 
-const LOG_EVENT_TYPES = new Set([
-  "error",
-  "session.created",
-  "session.updated",
-  "input_audio_buffer.speech_started",
-  "input_audio_buffer.speech_stopped",
-  "input_audio_buffer.committed",
-  "response.created",
-  "response.done",
-]);
-
 fastify.addHook("onRequest", async (request) => {
   console.log(`[HTTP] ${request.method} ${request.url}`);
 });
 
-fastify.get("/", async () => {
-  return { message: "Twilio Media Stream Server is running!" };
-});
+fastify.get("/", async () => ({ message: "Twilio Media Stream Server is running!" }));
 
 fastify.get("/health", async (_req, reply) => {
   reply.code(200).send("ok");
@@ -82,14 +69,17 @@ fastify.all("/incoming-call", async (request, reply) => {
   reply.type("text/xml").send(twimlResponse);
 });
 
-// Twilio Media Streams WS
 fastify.register(async (f) => {
-  f.get("/media-stream", { websocket: true }, (connection, _req) => {
+  f.get("/media-stream", { websocket: true }, (connection) => {
     console.log("Client connected (Twilio WS)");
 
     let streamSid = null;
-    let awaitingResponse = false;
+    let twilioReady = false;
+
     let openAiReady = false;
+    let sessionConfigured = false;
+
+    let awaitingResponse = false;
 
     const openAiWs = new WebSocket(
       `wss://api.openai.com/v1/realtime?model=gpt-realtime`,
@@ -101,37 +91,33 @@ fastify.register(async (f) => {
       }
     );
 
-    // ✅ IMPORTANT: fara session.audio / output_modalities / etc
-    const sendSessionUpdate = () => {
+    const maybeKickoff = () => {
+      // Pornim doar când sunt gata AMBELE:
+      if (!openAiReady || !twilioReady) return;
+      if (sessionConfigured) return;
+
+      sessionConfigured = true;
+
+      // ✅ Schema fără session.audio, cu formate audio explicite pentru Twilio (PCMU = g711_ulaw)
       const sessionUpdate = {
         type: "session.update",
         session: {
           instructions: SYSTEM_MESSAGE,
           temperature: TEMPERATURE,
-          // voice e ok sa fie aici (nu e "session.audio")
           voice: VOICE,
+          turn_detection: { type: "server_vad" },
+
+          // IMPORTANT pentru Twilio:
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
         },
       };
 
       console.log("Sending session.update to OpenAI");
       openAiWs.send(JSON.stringify(sessionUpdate));
-    };
 
-    const requestAudioResponse = () => {
-      openAiWs.send(
-        JSON.stringify({
-          type: "response.create",
-          response: {
-            modalities: ["audio", "text"], // ✅ combinatia acceptata
-            temperature: TEMPERATURE,
-          },
-        })
-      );
-      awaitingResponse = true;
-    };
-
-    const sendInitialPrompt = () => {
-      const item = {
+      // AI vorbește primul
+      const initialItem = {
         type: "conversation.item.create",
         item: {
           type: "message",
@@ -146,19 +132,25 @@ fastify.register(async (f) => {
           ],
         },
       };
-      openAiWs.send(JSON.stringify(item));
-      requestAudioResponse();
+
+      openAiWs.send(JSON.stringify(initialItem));
+
+      openAiWs.send(
+        JSON.stringify({
+          type: "response.create",
+          response: {
+            modalities: ["audio", "text"],
+            temperature: TEMPERATURE,
+          },
+        })
+      );
+      awaitingResponse = true;
     };
 
     openAiWs.on("open", () => {
       console.log("Connected to OpenAI Realtime WS");
       openAiReady = true;
-
-      setTimeout(() => {
-        sendSessionUpdate();
-        // dacă vrei ca AI să vorbească primul:
-        sendInitialPrompt();
-      }, 100);
+      maybeKickoff();
     });
 
     openAiWs.on("message", (raw) => {
@@ -170,17 +162,24 @@ fastify.register(async (f) => {
         return;
       }
 
-      if (LOG_EVENT_TYPES.has(msg.type)) {
-        console.log(`Received event: ${msg.type}`);
-      }
-
       if (msg.type === "error") {
         console.error("OPENAI ERROR:", JSON.stringify(msg, null, 2));
         awaitingResponse = false;
         return;
       }
 
-      // OpenAI audio -> Twilio
+      // Debug util
+      if (
+        msg.type === "session.created" ||
+        msg.type === "session.updated" ||
+        msg.type === "input_audio_buffer.committed" ||
+        msg.type === "response.created" ||
+        msg.type === "response.done"
+      ) {
+        console.log(`Received event: ${msg.type}`);
+      }
+
+      // ✅ Asta e esențial: audio delta de la OpenAI -> Twilio
       if (msg.type === "response.output_audio.delta" && msg.delta && streamSid) {
         connection.send(
           JSON.stringify({
@@ -191,12 +190,19 @@ fastify.register(async (f) => {
         );
       }
 
-      // după ce VAD a comis speech-ul, cerem un răspuns (o singură dată)
+      // când server_vad a comis speech-ul, cerem un nou răspuns (o singură dată)
       if (msg.type === "input_audio_buffer.committed") {
-        if (!awaitingResponse) requestAudioResponse();
+        if (!awaitingResponse) {
+          openAiWs.send(
+            JSON.stringify({
+              type: "response.create",
+              response: { modalities: ["audio", "text"], temperature: TEMPERATURE },
+            })
+          );
+          awaitingResponse = true;
+        }
       }
 
-      // la final de răspuns, permitem altul
       if (msg.type === "response.done") {
         awaitingResponse = false;
 
@@ -231,7 +237,9 @@ fastify.register(async (f) => {
       switch (data.event) {
         case "start":
           streamSid = data.start.streamSid;
+          twilioReady = true;
           console.log("Incoming stream started:", streamSid);
+          maybeKickoff();
           break;
 
         case "media":
