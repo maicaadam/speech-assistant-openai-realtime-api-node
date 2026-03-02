@@ -102,8 +102,17 @@ fastify.register(async (f) => {
     );
 
     const sendSessionUpdate = () => {
-      // ✅ NU trimitem session.output_modalities (a dat error la tine)
-      // Setăm doar instrucțiuni + audio formats compatibile Twilio (PCMU)
+  const sessionUpdate = {
+    type: "session.update",
+    session: {
+      instructions: SYSTEM_MESSAGE,
+      temperature: TEMPERATURE,
+    },
+  };
+
+  console.log("Sending session.update to OpenAI");
+  openAiWs.send(JSON.stringify(sessionUpdate));
+};
       const sessionUpdate = {
         type: "session.update",
         session: {
@@ -132,7 +141,7 @@ fastify.register(async (f) => {
         JSON.stringify({
           type: "response.create",
           response: {
-            modalities: ["audio"],
+            modalities: ["audio", "text"],
             temperature: TEMPERATURE,
           },
         })
