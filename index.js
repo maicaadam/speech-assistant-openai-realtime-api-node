@@ -283,10 +283,30 @@ fastify.register(async (fastify) => {
     });
 });
 
-fastify.listen({ port: PORT, host: "0.0.0.0" }, (err) => {
-  if (err) {
+fastify.ready((err) => {
+  if (err) console.error("Fastify not ready:", err);
+  else console.log("Fastify ready");
+});
+
+const start = async () => {
+  try {
+    await fastify.listen({ port: PORT, host: "0.0.0.0" });
+    console.log(`Server is listening on port ${PORT}`);
+  } catch (err) {
     console.error(err);
     process.exit(1);
   }
-  console.log(`Server is listening on port ${PORT}`);
+};
+start();
+
+process.on("SIGTERM", async () => {
+  console.log("Received SIGTERM - shutting down gracefully");
+  try {
+    await fastify.close();
+    console.log("Fastify closed");
+  } catch (e) {
+    console.error("Error during shutdown:", e);
+  } finally {
+    process.exit(0);
+  }
 });
