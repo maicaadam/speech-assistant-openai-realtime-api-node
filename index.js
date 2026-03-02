@@ -86,19 +86,17 @@ fastify.all("/incoming-call", async (request, reply) => {
 
 // WebSocket endpoint pentru Twilio Media Streams
 fastify.register(async (f) => {
-  f.get("/media-stream", { websocket: true }, (connection, req) => {
+  f.get("/media-stream", { websocket: true }, (connection, _req) => {
     console.log("Client connected (Twilio WS)");
 
     let streamSid = null;
     let latestMediaTimestamp = 0;
 
-    // IMPORTANT: model & endpoint realtime
     const openAiWs = new WebSocket(
       `wss://api.openai.com/v1/realtime?model=gpt-realtime`,
       {
         headers: {
           Authorization: `Bearer ${OPENAI_API_KEY}`,
-          // Uneori ajută (în funcție de cont/feature flags). Dacă nu e necesar, nu strică.
           "OpenAI-Beta": "realtime=v1",
         },
       }
@@ -107,25 +105,22 @@ fastify.register(async (f) => {
     let openAiReady = false;
     let awaitingResponse = false;
 
+    // ✅ FIX #1: NU trimite session.output_modalities (era cauza "Unknown parameter")
+    // păstrăm doar câmpuri compatibile; modalitățile le cerem în response.create.
     const sendSessionUpdate = () => {
-      // Schema compatibilă cu audio Twilio (PCMU = G.711 u-law)
       const sessionUpdate = {
         type: "session.update",
         session: {
-          // setările de audio
-          output_modalities: ["audio"],
-          audio: {
-            input: {
-              format: { type: "audio/pcmu" },
-              turn_detection: { type: "server_vad" },
-            },
-            output: {
-              format: { type: "audio/pcmu" },
-              voice: VOICE,
-            },
-          },
           instructions: SYSTEM_MESSAGE,
           temperature: TEMPERATURE,
+
+          // Audio compatibil Twilio Media Streams (PCMU / G.711 u-law)
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
+          voice: VOICE,
+
+          // VAD pe server (OpenAI)
+          turn_detection: { type: "server_vad" },
         },
       };
 
@@ -133,8 +128,22 @@ fastify.register(async (f) => {
       openAiWs.send(JSON.stringify(sessionUpdate));
     };
 
+    const requestAudioResponse = () => {
+      openAiWs.send(
+        JSON.stringify({
+          type: "response.create",
+          response: {
+            // aici controlăm output-ul
+            output_modalities: ["audio"],
+            temperature: TEMPERATURE,
+          },
+        })
+      );
+      awaitingResponse = true;
+    };
+
     const sendInitialPrompt = () => {
-      // AI vorbește primul (opțional). Dacă nu vrei, comentează blocul ăsta.
+      // AI vorbește primul (opțional). Dacă nu vrei, comentează apelul la sendInitialPrompt()
       const initialConversationItem = {
         type: "conversation.item.create",
         item: {
@@ -152,15 +161,13 @@ fastify.register(async (f) => {
       };
 
       openAiWs.send(JSON.stringify(initialConversationItem));
-      openAiWs.send(JSON.stringify({ type: "response.create" }));
-      awaitingResponse = true;
+      requestAudioResponse();
     };
 
     openAiWs.on("open", () => {
       console.log("Connected to OpenAI Realtime WS");
       openAiReady = true;
 
-      // trimite setările sesiuni + salutul inițial
       setTimeout(() => {
         sendSessionUpdate();
         // dacă vrei ca AI să vorbească primul:
@@ -178,21 +185,18 @@ fastify.register(async (f) => {
       }
 
       if (LOG_EVENT_TYPES.has(msg.type)) {
-        if (msg.type === "response.output_audio.delta") {
-          // nu spama cu dump mare
-        } else {
+        if (msg.type !== "response.output_audio.delta") {
           console.log(`Received event: ${msg.type}`);
         }
       }
 
-      // IMPORTANT: vezi motivul real al erorii
       if (msg.type === "error") {
         console.error("OPENAI ERROR:", JSON.stringify(msg, null, 2));
         awaitingResponse = false;
         return;
       }
 
-      // când OpenAI îți dă audio, îl forwardezi către Twilio
+      // audio -> Twilio
       if (msg.type === "response.output_audio.delta" && msg.delta && streamSid) {
         connection.send(
           JSON.stringify({
@@ -203,20 +207,14 @@ fastify.register(async (f) => {
         );
       }
 
-      // după ce input audio a fost “committed” (server_vad), cerem răspuns
+      // când VAD a comis audio-ul, cerem răspuns (o singură dată per turn)
       if (msg.type === "input_audio_buffer.committed") {
-        // evităm să trimitem response.create de 3 ori
-        if (!awaitingResponse) {
-          openAiWs.send(JSON.stringify({ type: "response.create" }));
-          awaitingResponse = true;
-        }
+        if (!awaitingResponse) requestAudioResponse();
       }
 
-      // când răspunsul s-a terminat, permitem unul nou
       if (msg.type === "response.done") {
         awaitingResponse = false;
 
-        // dacă a eșuat, log detaliat
         if (msg.response?.status === "failed") {
           console.error(
             "OPENAI RESPONSE FAILED:",
@@ -235,7 +233,7 @@ fastify.register(async (f) => {
       console.error("OpenAI WS error:", err);
     });
 
-    // Mesaje venite de la Twilio (audio + start/stop)
+    // Mesaje venite de la Twilio
     connection.on("message", (message) => {
       let data;
       try {
@@ -256,7 +254,7 @@ fastify.register(async (f) => {
           latestMediaTimestamp = data.media.timestamp;
 
           if (openAiReady && openAiWs.readyState === WebSocket.OPEN) {
-            // Twilio trimite payload base64 PCMU => îl trimitem la OpenAI
+            // Twilio payload base64 PCMU -> OpenAI input_audio_buffer.append
             openAiWs.send(
               JSON.stringify({
                 type: "input_audio_buffer.append",
