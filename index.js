@@ -1,29 +1,25 @@
-import Fastify from 'fastify';
-import WebSocket from 'ws';
-import dotenv from 'dotenv';
-import fastifyFormBody from '@fastify/formbody';
-import fastifyWs from '@fastify/websocket';
+import Fastify from "fastify";
+import WebSocket from "ws";
+import dotenv from "dotenv";
+import fastifyFormBody from "@fastify/formbody";
+import fastifyWs from "@fastify/websocket";
 
-// Load environment variables from .env file
 dotenv.config();
 
-// Retrieve the OpenAI API key from environment variables.
-const { OPENAI_API_KEY } = process.env;
-const { PUBLIC_URL } = process.env;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const PUBLIC_URL = process.env.PUBLIC_URL; // ex: https://xxxx.up.railway.app (NU wss)
+const AGENCY_NAME = process.env.AGENCY_NAME || "Agentia X";
 
 if (!OPENAI_API_KEY) {
-    console.error('Missing OpenAI API key. Please set it in the .env file.');
-    process.exit(1);
+  console.error("Missing OpenAI API key. Please set OPENAI_API_KEY in Railway variables.");
+  process.exit(1);
 }
 
-// Initialize Fastify
-const fastify = Fastify();
+const fastify = Fastify({ logger: false });
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
-// Constants
-const AGENCY_NAME = process.env.AGENCY_NAME || "Agentia X";
-
+// ---------- Config ----------
 const SYSTEM_MESSAGE = `
 Ești un agent virtual telefonic pentru o agenție imobiliară din România: ${AGENCY_NAME}.
 Vorbești DOAR în limba română, politicos, clar, concis.
@@ -39,332 +35,317 @@ Reguli:
 - Dacă clientul nu știe codul anunțului, întreabă: oraș, zonă/cartier, tip (apartament/casă/teren), nr camere, buget.
 - Fii scurt: 1 întrebare o dată.
 - La final, confirmă informațiile și încheie politicos.
-`;
-const VOICE = 'alloy';
-const TEMPERATURE = 0.8; // Controls the randomness of the AI's responses
-const PORT = process.env.PORT || 8080; // Allow dynamic port assignment
+`.trim();
 
-// List of Event Types to log to the console. See the OpenAI Realtime API Documentation: https://platform.openai.com/docs/api-reference/realtime
-const LOG_EVENT_TYPES = [
-    'error',
-    'response.content.done',
-    'rate_limits.updated',
-    'response.done',
-    'input_audio_buffer.committed',
-    'input_audio_buffer.speech_stopped',
-    'input_audio_buffer.speech_started',
-    'session.created',
-    'session.updated'
-];
+const VOICE = "alloy"; // aici e motivul pronunției nasoale la română; e ok funcțional, dar accentul nu e grozav.
+const TEMPERATURE = 0.7;
 
-// Show AI response elapsed timing calculations
-const SHOW_TIMING_MATH = false;
+const PORT = Number(process.env.PORT) || 8080;
 
-// Root Route
-fastify.get('/', async (request, reply) => {
-    reply.send({ message: 'Twilio Media Stream Server is running!' });
+// loguri utile
+const LOG_EVENT_TYPES = new Set([
+  "error",
+  "rate_limits.updated",
+  "session.created",
+  "session.updated",
+  "input_audio_buffer.speech_started",
+  "input_audio_buffer.speech_stopped",
+  "input_audio_buffer.committed",
+  "response.done",
+]);
+
+// ---------- Routes ----------
+fastify.addHook("onRequest", async (request) => {
+  console.log(`[HTTP] ${request.method} ${request.url}`);
 });
 
-fastify.get('/health', async (request, reply) => {
-  reply.code(200).send('ok');
+fastify.get("/", async (request, reply) => {
+  reply.send({ message: "Twilio Media Stream Server is running!" });
 });
 
-fastify.addHook('onRequest', async (request, reply) => {
-    console.log(`[HTTP] ${request.method} ${request.url}`);
+fastify.get("/health", async (request, reply) => {
+  reply.code(200).send("ok");
 });
 
-// Route for Twilio to handle incoming calls
-// <Say> punctuation to improve text-to-speech translation
-fastify.all('/incoming-call', async (request, reply) => {
-  const wsBase =
-    (PUBLIC_URL ? PUBLIC_URL : `https://${request.headers.host}`)
-      .replace(/^http:\/\//, 'ws://')
-      .replace(/^https:\/\//, 'wss://');
+// Twilio webhook
+fastify.all("/incoming-call", async (request, reply) => {
+  const hostFromRequest = request.headers.host;
+
+  // PUBLIC_URL trebuie să fie https://... (nu wss)
+  // dacă nu există, folosim host-ul requestului
+  const baseHttp = (PUBLIC_URL ? PUBLIC_URL : `https://${hostFromRequest}`).trim();
+
+  const wsBase = baseHttp
+    .replace(/^http:\/\//i, "ws://")
+    .replace(/^https:\/\//i, "wss://");
 
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
-    <Response>
-      <Say voice="Polly.Carmen" language="ro-RO">
-        Bună! Vă rog să așteptați. Vă conectez la agentul virtual al agenției.
-      </Say>
-      <Connect>
-        <Stream url="${wsBase}/media-stream" />
-      </Connect>
-    </Response>`;
+<Response>
+  <Say voice="Polly.Carmen" language="ro-RO">
+    Bună! Vă rog să așteptați. Vă conectez la agentul virtual al agenției.
+  </Say>
+  <Connect>
+    <Stream url="${wsBase}/media-stream" />
+  </Connect>
+</Response>`;
 
-  reply.type('text/xml').send(twimlResponse);
+  reply.type("text/xml").send(twimlResponse);
 });
 
-// WebSocket route for media-stream
-fastify.register(async (fastify) => {
-    fastify.get('/media-stream', { websocket: true }, (connection, req) => {
-        console.log('Client connected');
+// ---------- WebSocket (Twilio <-> OpenAI) ----------
+fastify.register(async (f) => {
+  f.get("/media-stream", { websocket: true }, (connection, req) => {
+    console.log("Client connected (Twilio WS)");
 
-        // Connection-specific state
-        let streamSid = null;
-        let latestMediaTimestamp = 0;
-        let lastAssistantItem = null;
-        let markQueue = [];
-        let responseStartTimestampTwilio = null;
+    let streamSid = null;
+    let latestMediaTimestamp = 0;
+    let lastAssistantItem = null;
+    let markQueue = [];
+    let responseStartTimestampTwilio = null;
 
-        const openAiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=gpt-realtime`, {
-            headers: {
-                Authorization: `Bearer ${OPENAI_API_KEY}`,
-            }
-        });
+    // OpenAI Realtime WS
+    const openAiWs = new WebSocket("wss://api.openai.com/v1/realtime?model=gpt-realtime", {
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    });
 
-        // Control initial session with OpenAI
-const sessionUpdate = {
-  type: "session.update",
-  session: {
-    type: "realtime",
-    model: "gpt-realtime",
-
-    // IMPORTANT: schema corecta
-    input_audio_format: "g711_ulaw",
-    output_audio_format: "g711_ulaw",
-    voice: VOICE, // ex: alloy / marin / cedar
-    instructions: SYSTEM_MESSAGE,
-
-    // optional, dar util:
-    turn_detection: { type: "server_vad" },
-  },
-};
-
-            console.log('Sending session update:', JSON.stringify(sessionUpdate));
-            openAiWs.send(JSON.stringify(sessionUpdate));
-
-            // Uncomment the following line to have AI speak first:
-            // sendInitialConversationItem();
-        };
-
-        // Send initial conversation item if AI talks first
-        const sendInitialConversationItem = () => {
-            const initialConversationItem = {
-                type: 'conversation.item.create',
-                item: {
-                    type: 'message',
-                    role: 'user',
-                    content: [
-                        {
-                            type: 'input_text',
-                            text: 
-                                `Bună! Sunt agentul virtual de la ${AGENCY_NAME}. ` +
-                                `Vă ajut rapid cu solicitarea. Pentru ce proprietate sunați? ` +
-                                `Dacă aveți codul anunțului sau un link, spuneți-mi.`
-                        }
-                    ]
-                }
-            };
-
-            openAiWs.send(JSON.stringify(initialConversationItem));
-            openAiWs.send(JSON.stringify({
-  type: "response.create",
-  response: {
-    temperature: TEMPERATURE,
-    modalities: ["audio"],
-  }
-}));
-        };
-
-        // Handle interruption when the caller's speech starts
-        const handleSpeechStartedEvent = () => {
-            if (markQueue.length > 0 && responseStartTimestampTwilio != null) {
-                const elapsedTime = latestMediaTimestamp - responseStartTimestampTwilio;
-                if (SHOW_TIMING_MATH) console.log(`Calculating elapsed time for truncation: ${latestMediaTimestamp} - ${responseStartTimestampTwilio} = ${elapsedTime}ms`);
-
-                if (lastAssistantItem) {
-                    const truncateEvent = {
-                        type: 'conversation.item.truncate',
-                        item_id: lastAssistantItem,
-                        content_index: 0,
-                        audio_end_ms: elapsedTime
-                    };
-                    if (SHOW_TIMING_MATH) console.log('Sending truncation event:', JSON.stringify(truncateEvent));
-                    openAiWs.send(JSON.stringify(truncateEvent));
-                }
-
-                connection.send(JSON.stringify({
-                    event: 'clear',
-                    streamSid: streamSid
-                }));
-
-                // Reset
-                markQueue = [];
-                lastAssistantItem = null;
-                responseStartTimestampTwilio = null;
-            }
-        };
-
-        // Send mark messages to Media Streams so we know if and when AI response playback is finished
-        const sendMark = (connection, streamSid) => {
-            if (streamSid) {
-                const markEvent = {
-                    event: 'mark',
-                    streamSid: streamSid,
-                    mark: { name: 'responsePart' }
-                };
-                connection.send(JSON.stringify(markEvent));
-                markQueue.push('responsePart');
-            }
-        };
-
-        // Open event for OpenAI WebSocket
-        openAiWs.on('open', () => {
-            console.log('Connected to the OpenAI Realtime API');
-            setTimeout(() => {
-                initializeSession();
-                sendInitialConversationItem();
-            }, 100);
-        });
-        
-
-        // Listen for messages from the OpenAI WebSocket (and send to Twilio if necessary)
-        openAiWs.on('message', (data) => {
-            try {
-                const response = JSON.parse(data);
-
-                if (LOG_EVENT_TYPES.includes(response.type)) {
-                  console.log(`Received event: ${response.type}`);
-                  console.log(JSON.stringify(response, null, 2));
-                }
-
-                if (response.type === 'response.done' && response.response?.status === 'failed') {
-                  console.error('OPENAI FAILED DETAILS:',
-                    JSON.stringify(response.response?.status_details, null, 2)
-                  );
-                }
-                        
-
-                if (response.type === "response.output_text.delta" && response.delta) {
-                  console.log("SUMMARY_DELTA:", response.delta);
-                }
-
-                if (response.type === "response.output_text.done" && response.text) {
-                  console.log("SUMMARY_DONE:", response.text);
-                }
-
-                if (response.type === 'response.output_audio.delta' && response.delta) {
-                    const audioDelta = {
-                        event: 'media',
-                        streamSid: streamSid,
-                        media: { payload: response.delta }
-                    };
-                    connection.send(JSON.stringify(audioDelta));
-
-                    // First delta from a new response starts the elapsed time counter
-                    if (!responseStartTimestampTwilio) {
-                        responseStartTimestampTwilio = latestMediaTimestamp;
-                        if (SHOW_TIMING_MATH) console.log(`Setting start timestamp for new response: ${responseStartTimestampTwilio}ms`);
-                    }
-
-                    if (response.item_id) {
-                        lastAssistantItem = response.item_id;
-                    }
-                    
-                    sendMark(connection, streamSid);
-                }
-
-                if (response.type === 'input_audio_buffer.speech_started') {
-                    handleSpeechStartedEvent();
-                }
-            } catch (error) {
-                console.error('Error processing OpenAI message:', error, 'Raw message:', data);
-            }
-        });
-
-        // Handle incoming messages from Twilio
-        connection.on('message', (message) => {
-            try {
-                const data = JSON.parse(message);
-
-                switch (data.event) {
-                    case 'media':
-                        latestMediaTimestamp = data.media.timestamp;
-                        if (SHOW_TIMING_MATH) console.log(`Received media message with timestamp: ${latestMediaTimestamp}ms`);
-                        if (openAiWs.readyState === WebSocket.OPEN) {
-                            const audioAppend = {
-                                type: 'input_audio_buffer.append',
-                                audio: data.media.payload
-                            };
-                            openAiWs.send(JSON.stringify(audioAppend));
-                        }
-                        break;
-                    case 'start':
-                        streamSid = data.start.streamSid;
-                        console.log('Incoming stream has started', streamSid);
-
-                        // Reset start and media timestamp on a new stream
-                        responseStartTimestampTwilio = null; 
-                        latestMediaTimestamp = 0;
-                        break;
-                    case 'mark':
-                        if (markQueue.length > 0) {
-                            markQueue.shift();
-                        }
-                        break;
-                    default:
-                        console.log('Received non-media event:', data.event);
-                        break;
-                }
-            } catch (error) {
-                console.error('Error parsing message:', error, 'Message:', message);
-            }
-        });
-
-        // Handle connection close
-connection.on('close', () => {
-  console.log('Client disconnected. Generating summary...');
-
-  if (openAiWs.readyState === WebSocket.OPEN) {
-    // cerem un rezumat text (îl primim în logs)
-    const summaryPrompt = {
-      type: "conversation.item.create",
-      item: {
-        type: "message",
-        role: "user",
-        content: [
-          {
-            type: "input_text",
-            text:
-              "Te rog generează un REZUMAT scurt pentru agent (max 8 linii) în română, cu câmpuri:\n" +
-              "- Proprietate (cod/link/zonă)\n" +
-              "- Tip + detalii (camere/mp)\n" +
-              "- Buget\n" +
-              "- Program vizionare\n" +
-              "- Nume client\n" +
-              "- Telefon (dacă a fost spus)\n" +
-              "- Alte observații\n"
-          }
-        ]
+    const safeSendOpenAI = (obj) => {
+      if (openAiWs.readyState === WebSocket.OPEN) {
+        openAiWs.send(JSON.stringify(obj));
       }
     };
 
-    openAiWs.send(JSON.stringify(summaryPrompt));
-    openAiWs.send(JSON.stringify({
-  type: "response.create",
-  response: {
-    modalities: ["text"],
-    temperature: 0.2
-  }
-}));
+    const initializeSession = () => {
+      // IMPORTANT: Twilio Media Streams trimite G.711 u-law (PCMU) base64.
+      // În Realtime API, asta se setează ca g711_ulaw.
+      const sessionUpdate = {
+        type: "session.update",
+        session: {
+          type: "realtime",
+          model: "gpt-realtime",
+          voice: VOICE,
+          instructions: SYSTEM_MESSAGE,
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
+          turn_detection: { type: "server_vad" },
+        },
+      };
 
-    // așteptăm 1 sec să vină răspunsul, apoi închidem
-    setTimeout(() => openAiWs.close(), 1000);
-  }
+      console.log("Sending session.update to OpenAI");
+      safeSendOpenAI(sessionUpdate);
+    };
 
-});
+    const sendInitialConversationItem = () => {
+      const initialConversationItem = {
+        type: "conversation.item.create",
+        item: {
+          type: "message",
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text:
+                `Bună! Sunt agentul virtual de la ${AGENCY_NAME}. ` +
+                `Spuneți-mi, vă rog, pentru ce proprietate sunați? ` +
+                `Dacă aveți codul anunțului sau un link, îl puteți spune acum.`,
+            },
+          ],
+        },
+      };
 
-        // Handle WebSocket close and errors
-        openAiWs.on('close', () => {
-            console.log('Disconnected from the OpenAI Realtime API');
-        });
+      safeSendOpenAI(initialConversationItem);
 
-        openAiWs.on('error', (error) => {
-            console.error('Error in the OpenAI WebSocket:', error);
-        });
+      // cerem răspuns audio
+      safeSendOpenAI({
+        type: "response.create",
+        response: {
+          modalities: ["audio"],
+          temperature: TEMPERATURE,
+        },
+      });
+    };
+
+    const sendMark = () => {
+      if (!streamSid) return;
+      connection.send(
+        JSON.stringify({
+          event: "mark",
+          streamSid,
+          mark: { name: "responsePart" },
+        })
+      );
+      markQueue.push("responsePart");
+    };
+
+    const handleSpeechStartedEvent = () => {
+      if (markQueue.length > 0 && responseStartTimestampTwilio != null) {
+        const elapsedTime = latestMediaTimestamp - responseStartTimestampTwilio;
+
+        if (lastAssistantItem) {
+          safeSendOpenAI({
+            type: "conversation.item.truncate",
+            item_id: lastAssistantItem,
+            content_index: 0,
+            audio_end_ms: elapsedTime,
+          });
+        }
+
+        // cere Twilio să “șteargă” audio bufferul redat
+        connection.send(JSON.stringify({ event: "clear", streamSid }));
+
+        markQueue = [];
+        lastAssistantItem = null;
+        responseStartTimestampTwilio = null;
+      }
+    };
+
+    openAiWs.on("open", () => {
+      console.log("Connected to OpenAI Realtime WS");
+      setTimeout(() => {
+        initializeSession();
+        sendInitialConversationItem();
+      }, 100);
     });
+
+    openAiWs.on("message", (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+
+        if (LOG_EVENT_TYPES.has(msg.type)) {
+          console.log(`Received event: ${msg.type}`);
+        }
+
+        // log detalii când fail
+        if (msg.type === "response.done" && msg.response?.status === "failed") {
+          console.error("OPENAI RESPONSE FAILED:", JSON.stringify(msg.response?.status_details, null, 2));
+        }
+
+        // audio spre Twilio
+        if (msg.type === "response.output_audio.delta" && msg.delta) {
+          connection.send(
+            JSON.stringify({
+              event: "media",
+              streamSid,
+              media: { payload: msg.delta },
+            })
+          );
+
+          if (!responseStartTimestampTwilio) {
+            responseStartTimestampTwilio = latestMediaTimestamp;
+          }
+          if (msg.item_id) lastAssistantItem = msg.item_id;
+
+          sendMark();
+        }
+
+        if (msg.type === "input_audio_buffer.speech_started") {
+          handleSpeechStartedEvent();
+        }
+
+        // rezumat text în logs (când cerem)
+        if (msg.type === "response.output_text.delta" && msg.delta) {
+          console.log("SUMMARY_DELTA:", msg.delta);
+        }
+        if (msg.type === "response.output_text.done" && msg.text) {
+          console.log("SUMMARY_DONE:", msg.text);
+        }
+      } catch (e) {
+        console.error("Error processing OpenAI message:", e);
+      }
+    });
+
+    // Twilio -> OpenAI
+    connection.on("message", (message) => {
+      try {
+        const data = JSON.parse(message.toString());
+
+        switch (data.event) {
+          case "start":
+            streamSid = data.start.streamSid;
+            latestMediaTimestamp = 0;
+            responseStartTimestampTwilio = null;
+            console.log("Incoming stream started:", streamSid);
+            break;
+
+          case "media":
+            latestMediaTimestamp = data.media.timestamp;
+            // Twilio trimite base64 audio (PCMU). Trimitem direct la OpenAI.
+            safeSendOpenAI({
+              type: "input_audio_buffer.append",
+              audio: data.media.payload,
+            });
+            break;
+
+          case "mark":
+            if (markQueue.length > 0) markQueue.shift();
+            break;
+
+          default:
+            console.log("Received non-media event:", data.event);
+            break;
+        }
+      } catch (err) {
+        console.error("Error parsing Twilio message:", err);
+      }
+    });
+
+    // când Twilio închide, cerem rezumat text (opțional)
+    connection.on("close", () => {
+      console.log("Client disconnected (Twilio WS). Generating summary...");
+
+      if (openAiWs.readyState === WebSocket.OPEN) {
+        safeSendOpenAI({
+          type: "conversation.item.create",
+          item: {
+            type: "message",
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text:
+                  "Te rog generează un REZUMAT scurt pentru agent (max 8 linii) în română, cu câmpuri:\n" +
+                  "- Proprietate (cod/link/zonă)\n" +
+                  "- Tip + detalii (camere/mp)\n" +
+                  "- Buget\n" +
+                  "- Program vizionare\n" +
+                  "- Nume client\n" +
+                  "- Telefon (dacă a fost spus)\n" +
+                  "- Alte observații\n",
+              },
+            ],
+          },
+        });
+
+        safeSendOpenAI({
+          type: "response.create",
+          response: {
+            modalities: ["text"],
+            temperature: 0.2,
+          },
+        });
+
+        setTimeout(() => {
+          try {
+            openAiWs.close();
+          } catch {}
+        }, 1200);
+      } else {
+        try {
+          openAiWs.close();
+        } catch {}
+      }
+    });
+
+    openAiWs.on("close", () => {
+      console.log("Disconnected from OpenAI Realtime WS");
+    });
+
+    openAiWs.on("error", (err) => {
+      console.error("OpenAI WS error:", err);
+    });
+  });
 });
 
+// ---------- Start server ----------
 fastify.ready((err) => {
   if (err) console.error("Fastify not ready:", err);
   else console.log("Fastify ready");
@@ -375,12 +356,14 @@ const start = async () => {
     await fastify.listen({ port: PORT, host: "0.0.0.0" });
     console.log(`Server is listening on port ${PORT}`);
   } catch (err) {
-    console.error(err);
+    console.error("Failed to start server:", err);
     process.exit(1);
   }
 };
+
 start();
 
+// Graceful shutdown (Railway poate trimite SIGTERM)
 process.on("SIGTERM", async () => {
   console.log("Received SIGTERM - shutting down gracefully");
   try {
