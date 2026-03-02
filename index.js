@@ -216,8 +216,16 @@ fastify.register(async (fastify) => {
                 const response = JSON.parse(data);
 
                 if (LOG_EVENT_TYPES.includes(response.type)) {
-                    console.log(`Received event: ${response.type}`, response);
+                  console.log(`Received event: ${response.type}`);
+                  console.log(JSON.stringify(response, null, 2));
                 }
+
+                if (response.type === 'response.done' && response.response?.status === 'failed') {
+                  console.error('OPENAI FAILED DETAILS:',
+                    JSON.stringify(response.response?.status_details, null, 2)
+                  );
+                }
+                        
 
                 if (response.type === "response.output_text.delta" && response.delta) {
                   console.log("SUMMARY_DELTA:", response.delta);
