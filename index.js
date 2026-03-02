@@ -22,7 +22,24 @@ fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
 // Constants
-const SYSTEM_MESSAGE = 'You are a helpful and bubbly AI assistant who loves to chat about anything the user is interested about and is prepared to offer them facts. You have a penchant for dad jokes, owl jokes, and rickrolling – subtly. Always stay positive, but work in a joke when appropriate.';
+const AGENCY_NAME = process.env.AGENCY_NAME || "Agentia X";
+
+const SYSTEM_MESSAGE = `
+Ești un agent virtual telefonic pentru o agenție imobiliară din România: ${AGENCY_NAME}.
+Vorbești DOAR în limba română, politicos, clar, concis.
+
+Scopul tău este:
+1) să afli pentru ce proprietate sună clientul (cod anunț / link / adresă / cartier / tip proprietate),
+2) să preiei date de contact (nume + număr de telefon dacă e diferit de cel de apel),
+3) să întrebi 2-3 detalii utile (buget, când ar vrea vizionare, cerințe),
+4) să anunți că un agent uman va reveni în maxim o oră.
+
+Reguli:
+- Nu promite lucruri sigure despre proprietate (preț, disponibilitate) dacă nu știi.
+- Dacă clientul nu știe codul anunțului, întreabă: oraș, zonă/cartier, tip (apartament/casă/teren), nr camere, buget.
+- Fii scurt: 1 întrebare o dată.
+- La final, confirmă informațiile și încheie politicos.
+`;
 const VOICE = 'alloy';
 const TEMPERATURE = 0.8; // Controls the randomness of the AI's responses
 const PORT = process.env.PORT || 8080; // Allow dynamic port assignment
@@ -66,11 +83,11 @@ fastify.all('/incoming-call', async (request, reply) => {
 
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
-      <Say voice="alice">
-        Please wait while we connect your call to the AI voice assistant.
+      <Say voice="alice" language="ro-RO">
+        Bună! Vă rog să așteptați. Vă conectez la agentul virtual al agenției.
       </Say>
       <Pause length="1"/>
-      <Say voice="alice">O.K. you can start talking!</Say>
+      <Say voice="alice" language="ro-RO">Gata. Puteți vorbi.</Say>
       <Connect>
         <Stream url="${wsBase}/media-stream" />
       </Connect>
@@ -130,13 +147,15 @@ fastify.register(async (fastify) => {
                     content: [
                         {
                             type: 'input_text',
-                            text: 'Greet the user with "Hello there! I am an AI voice assistant powered by Twilio and the OpenAI Realtime API. You can ask me for facts, jokes, or anything you can imagine. How can I help you?"'
+                            text: 
+                                `Bună! Sunt agentul virtual de la ${AGENCY_NAME}. ` +
+                                `Vă ajut rapid cu solicitarea. Pentru ce proprietate sunați? ` +
+                                `Dacă aveți codul anunțului sau un link, spuneți-mi.`
                         }
                     ]
                 }
             };
 
-            if (SHOW_TIMING_MATH) console.log('Sending initial conversation item:', JSON.stringify(initialConversationItem));
             openAiWs.send(JSON.stringify(initialConversationItem));
             openAiWs.send(JSON.stringify({ type: 'response.create' }));
         };
@@ -186,8 +205,12 @@ fastify.register(async (fastify) => {
         // Open event for OpenAI WebSocket
         openAiWs.on('open', () => {
             console.log('Connected to the OpenAI Realtime API');
-            setTimeout(initializeSession, 100);
+            setTimeout(() => {
+                initializeSession();
+                sendInitialConversationItem();
+            }, 100);
         });
+        
 
         // Listen for messages from the OpenAI WebSocket (and send to Twilio if necessary)
         openAiWs.on('message', (data) => {
@@ -196,6 +219,14 @@ fastify.register(async (fastify) => {
 
                 if (LOG_EVENT_TYPES.includes(response.type)) {
                     console.log(`Received event: ${response.type}`, response);
+                }
+
+                if (response.type === "response.output_text.delta" && response.delta) {
+                  console.log("SUMMARY_DELTA:", response.delta);
+                }
+
+                if (response.type === "response.output_text.done" && response.text) {
+                  console.log("SUMMARY_DONE:", response.text);
                 }
 
                 if (response.type === 'response.output_audio.delta' && response.delta) {
@@ -267,10 +298,41 @@ fastify.register(async (fastify) => {
         });
 
         // Handle connection close
-        connection.on('close', () => {
-            if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
-            console.log('Client disconnected.');
-        });
+connection.on('close', () => {
+  console.log('Client disconnected. Generating summary...');
+
+  if (openAiWs.readyState === WebSocket.OPEN) {
+    // cerem un rezumat text (îl primim în logs)
+    const summaryPrompt = {
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text:
+              "Te rog generează un REZUMAT scurt pentru agent (max 8 linii) în română, cu câmpuri:\n" +
+              "- Proprietate (cod/link/zonă)\n" +
+              "- Tip + detalii (camere/mp)\n" +
+              "- Buget\n" +
+              "- Program vizionare\n" +
+              "- Nume client\n" +
+              "- Telefon (dacă a fost spus)\n" +
+              "- Alte observații\n"
+          }
+        ]
+      }
+    };
+
+    openAiWs.send(JSON.stringify(summaryPrompt));
+    openAiWs.send(JSON.stringify({ type: "response.create", response: { output_modalities: ["text"] } }));
+
+    // așteptăm 1 sec să vină răspunsul, apoi închidem
+    setTimeout(() => openAiWs.close(), 1000);
+  }
+
+});
 
         // Handle WebSocket close and errors
         openAiWs.on('close', () => {
