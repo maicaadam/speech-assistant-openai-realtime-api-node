@@ -66,11 +66,11 @@ fastify.all('/incoming-call', async (request, reply) => {
 
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
-      <Say voice="Google.en-US-Chirp3-HD-Aoede">
-        Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Open A I Realtime API
+      <Say voice="alice">
+        Please wait while we connect your call to the AI voice assistant.
       </Say>
       <Pause length="1"/>
-      <Say voice="Google.en-US-Chirp3-HD-Aoede">O.K. you can start talking!</Say>
+      <Say voice="alice">O.K. you can start talking!</Say>
       <Connect>
         <Stream url="${wsBase}/media-stream" />
       </Connect>
