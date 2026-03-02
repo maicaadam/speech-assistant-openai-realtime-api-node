@@ -106,27 +106,29 @@ fastify.register(async (fastify) => {
         let markQueue = [];
         let responseStartTimestampTwilio = null;
 
-        const openAiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature=${TEMPERATURE}`, {
+        const openAiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=gpt-realtime`, {
             headers: {
                 Authorization: `Bearer ${OPENAI_API_KEY}`,
             }
         });
 
         // Control initial session with OpenAI
-        const initializeSession = () => {
-            const sessionUpdate = {
-                type: 'session.update',
-                session: {
-                    type: 'realtime',
-                    model: "gpt-realtime",
-                    output_modalities: ["audio"],
-                    audio: {
-                        input: { format: { type: 'audio/pcmu' }, turn_detection: { type: "server_vad" } },
-                        output: { format: { type: 'audio/pcmu' }, voice: VOICE },
-                    },
-                    instructions: SYSTEM_MESSAGE,
-                },
-            };
+const sessionUpdate = {
+  type: "session.update",
+  session: {
+    type: "realtime",
+    model: "gpt-realtime",
+
+    // IMPORTANT: schema corecta
+    input_audio_format: "g711_ulaw",
+    output_audio_format: "g711_ulaw",
+    voice: VOICE, // ex: alloy / marin / cedar
+    instructions: SYSTEM_MESSAGE,
+
+    // optional, dar util:
+    turn_detection: { type: "server_vad" },
+  },
+};
 
             console.log('Sending session update:', JSON.stringify(sessionUpdate));
             openAiWs.send(JSON.stringify(sessionUpdate));
@@ -155,7 +157,13 @@ fastify.register(async (fastify) => {
             };
 
             openAiWs.send(JSON.stringify(initialConversationItem));
-            openAiWs.send(JSON.stringify({ type: 'response.create' }));
+            openAiWs.send(JSON.stringify({
+  type: "response.create",
+  response: {
+    temperature: TEMPERATURE,
+    modalities: ["audio"],
+  }
+}));
         };
 
         // Handle interruption when the caller's speech starts
@@ -332,7 +340,13 @@ connection.on('close', () => {
     };
 
     openAiWs.send(JSON.stringify(summaryPrompt));
-    openAiWs.send(JSON.stringify({ type: "response.create", response: { output_modalities: ["text"] } }));
+    openAiWs.send(JSON.stringify({
+  type: "response.create",
+  response: {
+    modalities: ["text"],
+    temperature: 0.2
+  }
+}));
 
     // așteptăm 1 sec să vină răspunsul, apoi închidem
     setTimeout(() => openAiWs.close(), 1000);
