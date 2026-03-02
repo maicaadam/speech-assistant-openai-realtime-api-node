@@ -86,8 +86,6 @@ fastify.all('/incoming-call', async (request, reply) => {
       <Say voice="Polly.Carmen" language="ro-RO">
         Bună! Vă rog să așteptați. Vă conectez la agentul virtual al agenției.
       </Say>
-      <Pause length="1"/>
-      <Say voice="Polly.Carmen" language="ro-RO">Gata. Puteți vorbi.</Say>
       <Connect>
         <Stream url="${wsBase}/media-stream" />
       </Connect>
