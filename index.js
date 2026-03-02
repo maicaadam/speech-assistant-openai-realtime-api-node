@@ -101,33 +101,15 @@ fastify.register(async (f) => {
       }
     );
 
+    // ✅ IMPORTANT: fara session.audio / output_modalities / etc
     const sendSessionUpdate = () => {
-  const sessionUpdate = {
-    type: "session.update",
-    session: {
-      instructions: SYSTEM_MESSAGE,
-      temperature: TEMPERATURE,
-    },
-  };
-
-  console.log("Sending session.update to OpenAI");
-  openAiWs.send(JSON.stringify(sessionUpdate));
-};
       const sessionUpdate = {
         type: "session.update",
         session: {
           instructions: SYSTEM_MESSAGE,
           temperature: TEMPERATURE,
-          audio: {
-            input: {
-              format: { type: "audio/pcmu" },
-              turn_detection: { type: "server_vad" },
-            },
-            output: {
-              format: { type: "audio/pcmu" },
-              voice: VOICE,
-            },
-          },
+          // voice e ok sa fie aici (nu e "session.audio")
+          voice: VOICE,
         },
       };
 
@@ -136,12 +118,11 @@ fastify.register(async (f) => {
     };
 
     const requestAudioResponse = () => {
-      // ✅ AICI era buba: trebuie "modalities", NU "output_modalities"
       openAiWs.send(
         JSON.stringify({
           type: "response.create",
           response: {
-            modalities: ["audio", "text"],
+            modalities: ["audio", "text"], // ✅ combinatia acceptata
             temperature: TEMPERATURE,
           },
         })
@@ -175,9 +156,8 @@ fastify.register(async (f) => {
 
       setTimeout(() => {
         sendSessionUpdate();
-        // dacă vrei ca AI să vorbească primul, lasă așa:
+        // dacă vrei ca AI să vorbească primul:
         sendInitialPrompt();
-        // dacă NU vrei să vorbească primul, comentează linia de mai sus.
       }, 100);
     });
 
@@ -211,7 +191,7 @@ fastify.register(async (f) => {
         );
       }
 
-      // după ce VAD a comis speech-ul, cerem un răspuns (o dată)
+      // după ce VAD a comis speech-ul, cerem un răspuns (o singură dată)
       if (msg.type === "input_audio_buffer.committed") {
         if (!awaitingResponse) requestAudioResponse();
       }
