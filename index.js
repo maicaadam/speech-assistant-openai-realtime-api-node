@@ -65,8 +65,8 @@ fastify.get('/', async (request, reply) => {
     reply.send({ message: 'Twilio Media Stream Server is running!' });
 });
 
-fastify.get('/health', async () => {
-    return { ok: true };
+fastify.get('/health', async (request, reply) => {
+  reply.code(200).send('ok');
 });
 
 fastify.addHook('onRequest', async (request, reply) => {
