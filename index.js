@@ -9,6 +9,7 @@ dotenv.config();
 
 // Retrieve the OpenAI API key from environment variables.
 const { OPENAI_API_KEY } = process.env;
+const { PUBLIC_URL } = process.env;
 
 if (!OPENAI_API_KEY) {
     console.error('Missing OpenAI API key. Please set it in the .env file.');
@@ -50,17 +51,24 @@ fastify.get('/', async (request, reply) => {
 // Route for Twilio to handle incoming calls
 // <Say> punctuation to improve text-to-speech translation
 fastify.all('/incoming-call', async (request, reply) => {
-    const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
-                          <Response>
-                              <Say voice="Google.en-US-Chirp3-HD-Aoede">Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Open A I Realtime API</Say>
-                              <Pause length="1"/>
-                              <Say voice="Google.en-US-Chirp3-HD-Aoede">O.K. you can start talking!</Say>
-                              <Connect>
-                                  <Stream url="wss://${request.headers.host}/media-stream" />
-                              </Connect>
-                          </Response>`;
+  const wsBase =
+    (PUBLIC_URL ? PUBLIC_URL : `https://${request.headers.host}`)
+      .replace(/^http:\/\//, 'ws://')
+      .replace(/^https:\/\//, 'wss://');
 
-    reply.type('text/xml').send(twimlResponse);
+  const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+      <Say voice="Google.en-US-Chirp3-HD-Aoede">
+        Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Open A I Realtime API
+      </Say>
+      <Pause length="1"/>
+      <Say voice="Google.en-US-Chirp3-HD-Aoede">O.K. you can start talking!</Say>
+      <Connect>
+        <Stream url="${wsBase}/media-stream" />
+      </Connect>
+    </Response>`;
+
+  reply.type('text/xml').send(twimlResponse);
 });
 
 // WebSocket route for media-stream
