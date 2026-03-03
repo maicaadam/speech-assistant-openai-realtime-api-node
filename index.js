@@ -47,7 +47,7 @@ fastify.addHook("onRequest", async (req) => {
 fastify.get("/", async () => ({ ok: true }));
 fastify.get("/health", async (_req, reply) => reply.code(200).send("ok"));
 
-// Twilio webhook: fara <Say>
+// Twilio webhook
 fastify.all("/incoming-call", async (request, reply) => {
   const wsBase = (PUBLIC_URL ? PUBLIC_URL : `https://${request.headers.host}`)
     .replace(/^http:\/\//, "ws://")
@@ -69,17 +69,12 @@ fastify.register(async (f) => {
     console.log("Client connected (Twilio WS)");
 
     let streamSid = null;
-
-    // OpenAI state
     let openAiReady = false;
     let sessionUpdated = false;
-
-    // Prevent overlapping responses
     let responseInFlight = false;
-    let pendingResponse = false;
 
     const openAiWs = new WebSocket(
-      `wss://api.openai.com/v1/realtime?model=gpt-realtime`,
+      `wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01`,
       {
         headers: {
           Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -88,52 +83,29 @@ fastify.register(async (f) => {
       }
     );
 
+    // ✅ FIX: structură corectă pentru session.update
     const sendSessionUpdate = () => {
-      // ✅ schema “sigură” (fără session.type / session.model / input_audio_format etc.)
       const payload = {
         type: "session.update",
         session: {
-          output_modalities: ["audio", "text"],
-          audio: {
-            input: {
-              format: { type: "audio/pcmu" },
-              // IMPORTANT: nu auto-crea response (altfel te lovești de active response)
-              turn_detection: { type: "server_vad", create_response: false },
-            },
-            output: {
-              format: { type: "audio/pcmu" },
-              voice: VOICE,
-            },
-          },
+          modalities: ["audio", "text"],
+          voice: VOICE,
           instructions: SYSTEM_MESSAGE,
           temperature: TEMPERATURE,
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
+          turn_detection: {
+            type: "server_vad",
+            threshold: 0.5,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 500,
+            create_response: true, // ✅ VAD creează răspuns automat
+          },
         },
       };
 
       console.log("Sending session.update to OpenAI");
       openAiWs.send(JSON.stringify(payload));
-    };
-
-    const createResponse = (reason) => {
-      if (!openAiReady || !sessionUpdated) return;
-
-      if (responseInFlight) {
-        pendingResponse = true;
-        return;
-      }
-
-      responseInFlight = true;
-      pendingResponse = false;
-
-      console.log(`Sending response.create (${reason})`);
-      openAiWs.send(
-        JSON.stringify({
-          type: "response.create",
-          response: {
-            temperature: TEMPERATURE,
-          },
-        })
-      );
     };
 
     const sendGreeting = () => {
@@ -147,31 +119,33 @@ fastify.register(async (f) => {
               {
                 type: "input_text",
                 text:
-                  `Bună! Sunt agentul virtual de la ${AGENCY_NAME}. ` +
-                  `Pentru ce proprietate sunați? Dacă aveți codul anunțului sau un link, spuneți-mi.`,
+                  `Bună ziua! Ați sunat la ${AGENCY_NAME}. ` +
+                  `Cu ce vă pot ajuta? Dacă aveți codul anunțului sau un link, vă rog să îmi spuneți.`,
               },
             ],
           },
         })
       );
 
-      createResponse("greeting");
+      // Cerem răspuns manual doar pentru salut (VAD nu e activ încă)
+      openAiWs.send(
+        JSON.stringify({
+          type: "response.create",
+          response: { temperature: TEMPERATURE },
+        })
+      );
     };
 
     const bargeIn = () => {
       if (!responseInFlight) return;
 
-      // Oprim răspunsul în curs
       openAiWs.send(JSON.stringify({ type: "response.cancel" }));
-      // Curățăm audio buffer output
       openAiWs.send(JSON.stringify({ type: "output_audio_buffer.clear" }));
 
-      // Oprim playback la Twilio
       if (streamSid) {
         connection.send(JSON.stringify({ event: "clear", streamSid }));
       }
 
-      // eliberăm lock-ul local (altfel rămâne blocat)
       responseInFlight = false;
     };
 
@@ -203,13 +177,7 @@ fastify.register(async (f) => {
 
       if (msg.type === "error") {
         console.error("OPENAI ERROR:", JSON.stringify(msg, null, 2));
-        // dacă cumva tot ajungi la overlap, marchează pending și așteaptă done
-        if (msg?.error?.code === "conversation_already_has_active_response") {
-          responseInFlight = true;
-          pendingResponse = true;
-        } else {
-          responseInFlight = false;
-        }
+        responseInFlight = false;
         return;
       }
 
@@ -236,18 +204,15 @@ fastify.register(async (f) => {
         return;
       }
 
-      // Barge-in: user începe să vorbească peste AI
+      // Barge-in: user vorbește peste AI
       if (msg.type === "input_audio_buffer.speech_started") {
         bargeIn();
         return;
       }
 
-      // După committed, cerem răspuns (manual)
-      if (msg.type === "input_audio_buffer.committed") {
-        pendingResponse = true;
-        createResponse("vad_committed");
-        return;
-      }
+      // ✅ FIX: NU mai cerem response.create manual aici
+      // VAD cu create_response: true se ocupă automat
+      // if (msg.type === "input_audio_buffer.committed") { ... } <-- ELIMINAT
 
       if (msg.type === "response.done") {
         responseInFlight = false;
@@ -258,10 +223,6 @@ fastify.register(async (f) => {
             JSON.stringify(msg.response?.status_details, null, 2)
           );
         }
-
-        if (pendingResponse) {
-          createResponse("pending_after_done");
-        }
         return;
       }
     });
@@ -271,7 +232,6 @@ fastify.register(async (f) => {
       openAiReady = false;
       sessionUpdated = false;
       responseInFlight = false;
-      pendingResponse = false;
     });
 
     openAiWs.on("error", (err) => {
