@@ -20,7 +20,7 @@ const AGENCY_NAME = process.env.AGENCY_NAME || "Agentia X";
 const PORT = Number(process.env.PORT || 8080);
 
 const SYSTEM_MESSAGE = `
-Ești un agent virtual telefonic pentru o agenție imobiliară din România: ${AGENCY_NAME}.
+E�ti un agent virtual telefonic pentru o agenție imobiliară din România: ${AGENCY_NAME}.
 Vorbești DOAR în limba română, politicos, clar, concis.
 
 Scopul tău este:
@@ -39,7 +39,6 @@ Reguli:
 const VOICE = "alloy";
 const TEMPERATURE = 0.7;
 
-// ---- basic routes ----
 fastify.addHook("onRequest", async (req) => {
   console.log(`[HTTP] ${req.method} ${req.url}`);
 });
@@ -47,7 +46,6 @@ fastify.addHook("onRequest", async (req) => {
 fastify.get("/", async () => ({ ok: true }));
 fastify.get("/health", async (_req, reply) => reply.code(200).send("ok"));
 
-// Twilio webhook
 fastify.all("/incoming-call", async (request, reply) => {
   const wsBase = (PUBLIC_URL ? PUBLIC_URL : `https://${request.headers.host}`)
     .replace(/^http:\/\//, "ws://")
@@ -63,7 +61,6 @@ fastify.all("/incoming-call", async (request, reply) => {
   reply.type("text/xml").send(twiml);
 });
 
-// ---- Media Stream WS ----
 fastify.register(async (f) => {
   f.get("/media-stream", { websocket: true }, (connection) => {
     console.log("Client connected (Twilio WS)");
@@ -73,6 +70,7 @@ fastify.register(async (f) => {
     let sessionUpdated = false;
     let responseInFlight = false;
 
+    // ✅ FIX: model fără dată hardcodată
     const openAiWs = new WebSocket(
       `wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview`,
       {
@@ -83,7 +81,7 @@ fastify.register(async (f) => {
       }
     );
 
-    // ✅ FIX: structură corectă pentru session.update
+    // ✅ FIX: structură corectă session.update
     const sendSessionUpdate = () => {
       const payload = {
         type: "session.update",
@@ -99,7 +97,7 @@ fastify.register(async (f) => {
             threshold: 0.5,
             prefix_padding_ms: 300,
             silence_duration_ms: 500,
-            create_response: true, // ✅ VAD creează răspuns automat
+            create_response: true,
           },
         },
       };
@@ -127,7 +125,6 @@ fastify.register(async (f) => {
         })
       );
 
-      // Cerem răspuns manual doar pentru salut (VAD nu e activ încă)
       openAiWs.send(
         JSON.stringify({
           type: "response.create",
@@ -136,16 +133,15 @@ fastify.register(async (f) => {
       );
     };
 
+    // ✅ FIX: eliminat output_audio_buffer.clear care nu există în API
     const bargeIn = () => {
       if (!responseInFlight) return;
-
-      openAiWs.send(JSON.stringify({ type: "response.cancel" }));
-      // ✅ "output_audio_buffer.clear" nu există în API - eliminat
-
+      try {
+        openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+      } catch {}
       if (streamSid) {
         connection.send(JSON.stringify({ event: "clear", streamSid }));
       }
-
       responseInFlight = false;
     };
 
@@ -163,20 +159,7 @@ fastify.register(async (f) => {
         return;
       }
 
-      // ✅ DEBUG: logează toate evenimentele ca să vedem ce trimite OpenAI
       console.log(`[OAI EVENT] ${msg.type}`);
-
-      if (
-        msg.type === "session.created" ||
-        msg.type === "session.updated" ||
-        msg.type === "response.created" ||
-        msg.type === "response.done" ||
-        msg.type === "input_audio_buffer.speech_started" ||
-        msg.type === "input_audio_buffer.committed" ||
-        msg.type === "error"
-      ) {
-        console.log(`Received event: ${msg.type}`);
-      }
 
       if (msg.type === "error") {
         console.error("OPENAI ERROR:", JSON.stringify(msg, null, 2));
@@ -195,7 +178,6 @@ fastify.register(async (f) => {
         return;
       }
 
-      // AUDIO -> Twilio
       if (msg.type === "response.audio.delta" && msg.delta && streamSid) {
         connection.send(
           JSON.stringify({
@@ -207,19 +189,18 @@ fastify.register(async (f) => {
         return;
       }
 
-      // Barge-in: user vorbește peste AI
       if (msg.type === "input_audio_buffer.speech_started") {
         bargeIn();
         return;
       }
 
-      // ✅ FIX: NU mai cerem response.create manual aici
-      // VAD cu create_response: true se ocupă automat
-      // if (msg.type === "input_audio_buffer.committed") { ... } <-- ELIMINAT
+      if (msg.type === "response.audio.done") {
+        responseInFlight = false;
+        return;
+      }
 
       if (msg.type === "response.done") {
         responseInFlight = false;
-
         if (msg.response?.status === "failed") {
           console.error(
             "OPENAI FAILED DETAILS:",
@@ -241,7 +222,6 @@ fastify.register(async (f) => {
       console.error("OpenAI WS error:", err);
     });
 
-    // Twilio -> server
     connection.on("message", (message) => {
       let data;
       try {
