@@ -74,7 +74,7 @@ fastify.register(async (f) => {
     let responseInFlight = false;
 
     const openAiWs = new WebSocket(
-      `wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview`,
+      `wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01`,
       {
         headers: {
           Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -140,7 +140,7 @@ fastify.register(async (f) => {
       if (!responseInFlight) return;
 
       openAiWs.send(JSON.stringify({ type: "response.cancel" }));
-      openAiWs.send(JSON.stringify({ type: "output_audio_buffer.clear" }));
+      // ✅ "output_audio_buffer.clear" nu există în API - eliminat
 
       if (streamSid) {
         connection.send(JSON.stringify({ event: "clear", streamSid }));
@@ -162,6 +162,9 @@ fastify.register(async (f) => {
       } catch {
         return;
       }
+
+      // ✅ DEBUG: logează toate evenimentele ca să vedem ce trimite OpenAI
+      console.log(`[OAI EVENT] ${msg.type}`);
 
       if (
         msg.type === "session.created" ||
