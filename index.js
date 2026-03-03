@@ -47,14 +47,16 @@ fastify.addHook("onRequest", async (req) => {
 fastify.get("/", async () => ({ ok: true }));
 fastify.get("/health", async (_req, reply) => reply.code(200).send("ok"));
 
-// Twilio webhook: fara mesaj Twilio (fara <Say>)
+// Twilio webhook: fara mesaj <Say>
 fastify.all("/incoming-call", async (request, reply) => {
   const wsBase = (PUBLIC_URL ? PUBLIC_URL : `https://${request.headers.host}`)
     .replace(/^http:\/\//, "ws://")
     .replace(/^https:\/\//, "wss://");
 
+  // OPTIONAL: un mic Pause (silent) ajuta uneori la stabilizarea stream-ului.
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+  <Pause length="1"/>
   <Connect>
     <Stream url="${wsBase}/media-stream" />
   </Connect>
@@ -70,21 +72,23 @@ fastify.register(async (f) => {
 
     let streamSid = null;
 
+    // Twilio readiness: NU pornim OpenAI greeting pana nu vedem primul frame media
+    let twilioMediaSeen = false;
+
     // OpenAI state
     let openAiReady = false;
     let sessionUpdated = false;
 
-    // response control (no overlap)
+    // Response control
     let responseInFlight = false;
     let pendingResponse = false;
 
-    // Greeting gate (optional): lasam AI sa vorbeasca primul, apoi permitem user audio
+    // barge-in / greeting gating
+    let greetingSent = false;
     let allowUserAudioToOpenAI = false;
-    let greetingInProgress = false;
-    let greetingDone = false;
 
-    // extra: log audio delta sizes (debug)
-    const DEBUG_AUDIO_DELTA = false;
+    // debug audio
+    let audioDeltaCount = 0;
 
     const openAiWs = new WebSocket(
       `wss://api.openai.com/v1/realtime?model=gpt-realtime`,
@@ -97,8 +101,7 @@ fastify.register(async (f) => {
     );
 
     const sendSessionUpdate = () => {
-      if (!openAiReady) return;
-
+      // IMPORTANT: folosim schema care ți-a fost acceptată (session.updated apare în logs)
       const payload = {
         type: "session.update",
         session: {
@@ -107,7 +110,7 @@ fastify.register(async (f) => {
           voice: VOICE,
           turn_detection: { type: "server_vad" },
 
-          // Twilio Media Streams = G.711 u-law
+          // Twilio Media Streams = G.711 u-law (8k)
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
         },
@@ -119,7 +122,10 @@ fastify.register(async (f) => {
 
     const createResponse = (reason) => {
       if (!openAiReady || !sessionUpdated || !streamSid) return;
-      if (responseInFlight) return;
+      if (responseInFlight) {
+        pendingResponse = true;
+        return;
+      }
 
       responseInFlight = true;
       pendingResponse = false;
@@ -129,38 +135,20 @@ fastify.register(async (f) => {
         JSON.stringify({
           type: "response.create",
           response: {
-            modalities: ["audio", "text"],
+            modalities: ["audio", "text"], // audio-only NU e acceptat la tine
             temperature: TEMPERATURE,
           },
         })
       );
     };
 
-    const cancelResponseAndClearTwilio = (reason) => {
-      if (!streamSid) return;
-      if (!responseInFlight) return;
-
-      console.log(`BARGE-IN: cancel response + clear Twilio (${reason})`);
-
-      // 1) stop assistant generation immediately
-      try {
-        openAiWs.send(JSON.stringify({ type: "response.cancel" }));
-      } catch {}
-
-      // 2) stop Twilio playback buffer immediately
-      try {
-        connection.send(JSON.stringify({ event: "clear", streamSid }));
-      } catch {}
-
-      responseInFlight = false;
-      pendingResponse = false;
-    };
-
     const sendGreeting = () => {
-      if (greetingInProgress || greetingDone) return;
+      if (greetingSent) return;
+      if (!twilioMediaSeen) return; // ✅ cheia: așteptăm primul frame de la Twilio
+      greetingSent = true;
 
-      greetingInProgress = true;
-      allowUserAudioToOpenAI = false; // blocam audio user pana termina AI greeting
+      // în timpul greeting-ului, NU trimitem audio user la OpenAI (altfel se anulează cu turn_detected)
+      allowUserAudioToOpenAI = false;
 
       openAiWs.send(
         JSON.stringify({
@@ -183,11 +171,24 @@ fastify.register(async (f) => {
       createResponse("greeting");
     };
 
+    const maybeKickoff = () => {
+      // pornim doar când avem: OpenAI WS open + streamSid + primul media frame
+      if (!openAiReady || !streamSid || !twilioMediaSeen) return;
+
+      if (!sessionUpdated) {
+        sendSessionUpdate();
+        return;
+      }
+
+      // dacă sesiunea e deja updated, trimitem greeting
+      sendGreeting();
+    };
+
     // --- OpenAI events ---
     openAiWs.on("open", () => {
       console.log("Connected to OpenAI Realtime WS");
       openAiReady = true;
-      if (streamSid) sendSessionUpdate();
+      maybeKickoff();
     });
 
     openAiWs.on("message", (raw) => {
@@ -198,7 +199,6 @@ fastify.register(async (f) => {
         return;
       }
 
-      // minimal log
       if (
         msg.type === "session.created" ||
         msg.type === "session.updated" ||
@@ -206,7 +206,6 @@ fastify.register(async (f) => {
         msg.type === "response.done" ||
         msg.type === "input_audio_buffer.committed" ||
         msg.type === "input_audio_buffer.speech_started" ||
-        msg.type === "input_audio_buffer.speech_stopped" ||
         msg.type === "error"
       ) {
         console.log(`Received event: ${msg.type}`);
@@ -215,12 +214,11 @@ fastify.register(async (f) => {
       if (msg.type === "error") {
         console.error("OPENAI ERROR FULL:", JSON.stringify(msg, null, 2));
 
-        // daca e overlap, nu mai spama cu response.create
+        // dacă e active response, nu mai spama response.create
         if (msg?.error?.code === "conversation_already_has_active_response") {
           responseInFlight = true;
           pendingResponse = true;
         } else {
-          // pentru alte erori, permitem retry
           responseInFlight = false;
         }
         return;
@@ -228,32 +226,32 @@ fastify.register(async (f) => {
 
       if (msg.type === "session.updated") {
         sessionUpdated = true;
-        // dupa ce sesiunea e confirmata, trimitem greeting
-        sendGreeting();
+        // acum putem trimite greeting (dar tot așteptăm twilioMediaSeen)
+        maybeKickoff();
         return;
       }
 
-      // Mark in-flight as soon as OpenAI confirms
       if (msg.type === "response.created") {
         responseInFlight = true;
         return;
       }
 
-      // ✅ BARGE-IN: user începe să vorbească -> oprim botul și clear în Twilio
-      // IMPORTANT: trebuie să fim în modul "allowUserAudioToOpenAI" ca să fie conversațional.
-      // Dacă încă e greeting, ignorăm (că nu trimitem audio user oricum).
+      // ✅ BARGE-IN: dacă user începe să vorbească peste bot, anulăm răspunsul curent
       if (msg.type === "input_audio_buffer.speech_started") {
-        if (allowUserAudioToOpenAI && responseInFlight) {
-          cancelResponseAndClearTwilio("speech_started");
+        if (responseInFlight) {
+          console.log("BARGE-IN: cancelling current response");
+          openAiWs.send(JSON.stringify({ type: "response.cancel" }));
         }
         return;
       }
 
       // audio delta -> Twilio
       if (msg.type === "response.output_audio.delta" && msg.delta && streamSid) {
-        if (DEBUG_AUDIO_DELTA) {
-          console.log("AUDIO DELTA len:", msg.delta?.length || 0);
+        audioDeltaCount += 1;
+        if (audioDeltaCount <= 3) {
+          console.log(`AUDIO_DELTA #${audioDeltaCount} bytes(base64): ${msg.delta.length}`);
         }
+
         connection.send(
           JSON.stringify({
             event: "media",
@@ -267,15 +265,12 @@ fastify.register(async (f) => {
       if (msg.type === "response.done") {
         responseInFlight = false;
 
-        // daca greeting-ul s-a terminat, permitem audio user
-        if (greetingInProgress && !greetingDone) {
-          greetingDone = true;
-          greetingInProgress = false;
+        // dacă greeting-ul a terminat (sau a fost întrerupt), permitem audio user către OpenAI
+        if (greetingSent && !allowUserAudioToOpenAI) {
           allowUserAudioToOpenAI = true;
           console.log("Greeting finished. User audio is now enabled.");
         }
 
-        // daca a esuat, log detaliat
         if (msg.response?.status === "failed") {
           console.error(
             "OPENAI FAILED DETAILS:",
@@ -283,19 +278,17 @@ fastify.register(async (f) => {
           );
         }
 
-        // dacă aveam ceva pending (user a vorbit între timp), pornim acum
         if (pendingResponse) {
+          // trimitem după ce răspunsul curent s-a închis
           createResponse("pending_after_done");
         }
         return;
       }
 
       if (msg.type === "input_audio_buffer.committed") {
-        // cerem raspuns DOAR dupa ce greeting-ul e gata si user audio e permis
         if (!allowUserAudioToOpenAI) return;
-
         pendingResponse = true;
-        if (!responseInFlight) createResponse("vad_committed");
+        createResponse("vad_committed");
         return;
       }
     });
@@ -307,8 +300,8 @@ fastify.register(async (f) => {
       responseInFlight = false;
       pendingResponse = false;
       allowUserAudioToOpenAI = false;
-      greetingInProgress = false;
-      greetingDone = false;
+      greetingSent = false;
+      audioDeltaCount = 0;
     });
 
     openAiWs.on("error", (err) => {
@@ -328,11 +321,18 @@ fastify.register(async (f) => {
         case "start":
           streamSid = data.start.streamSid;
           console.log("Incoming stream started:", streamSid);
-          if (openAiReady) sendSessionUpdate();
+          // NU kickoff aici; așteptăm primul media frame
           break;
 
         case "media":
-          // IMPORTANT: in timpul greeting-ului, IGNORAM audio user ca sa nu declanseze turn_detected
+          // ✅ cheia: primul media frame => acum e “audio-ready”
+          if (!twilioMediaSeen) {
+            twilioMediaSeen = true;
+            console.log("First Twilio media frame received. Kickoff OpenAI now.");
+            maybeKickoff();
+          }
+
+          // în timpul greeting-ului, ignorăm audio user ca să nu anuleze turnul
           if (!allowUserAudioToOpenAI) return;
 
           if (openAiWs.readyState === WebSocket.OPEN) {
