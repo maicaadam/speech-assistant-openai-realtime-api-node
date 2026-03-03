@@ -196,7 +196,7 @@ fastify.register(async (f) => {
       }
 
       // AUDIO -> Twilio
-      if (msg.type === "response.output_audio.delta" && msg.delta && streamSid) {
+      if (msg.type === "response.audio.delta" && msg.delta && streamSid) {
         connection.send(
           JSON.stringify({
             event: "media",
