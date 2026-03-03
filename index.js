@@ -78,10 +78,13 @@ fastify.register(async (f) => {
     let responseInFlight = false;
     let pendingResponse = false;
 
-    // IMPORTANT: pana termina AI greeting-ul, NU trimitem audio user catre OpenAI
+    // Greeting gate (optional): lasam AI sa vorbeasca primul, apoi permitem user audio
     let allowUserAudioToOpenAI = false;
     let greetingInProgress = false;
     let greetingDone = false;
+
+    // extra: log audio delta sizes (debug)
+    const DEBUG_AUDIO_DELTA = false;
 
     const openAiWs = new WebSocket(
       `wss://api.openai.com/v1/realtime?model=gpt-realtime`,
@@ -94,6 +97,8 @@ fastify.register(async (f) => {
     );
 
     const sendSessionUpdate = () => {
+      if (!openAiReady) return;
+
       const payload = {
         type: "session.update",
         session: {
@@ -131,11 +136,31 @@ fastify.register(async (f) => {
       );
     };
 
+    const cancelResponseAndClearTwilio = (reason) => {
+      if (!streamSid) return;
+      if (!responseInFlight) return;
+
+      console.log(`BARGE-IN: cancel response + clear Twilio (${reason})`);
+
+      // 1) stop assistant generation immediately
+      try {
+        openAiWs.send(JSON.stringify({ type: "response.cancel" }));
+      } catch {}
+
+      // 2) stop Twilio playback buffer immediately
+      try {
+        connection.send(JSON.stringify({ event: "clear", streamSid }));
+      } catch {}
+
+      responseInFlight = false;
+      pendingResponse = false;
+    };
+
     const sendGreeting = () => {
       if (greetingInProgress || greetingDone) return;
 
       greetingInProgress = true;
-      allowUserAudioToOpenAI = false; // blocam audio user pana termina AI
+      allowUserAudioToOpenAI = false; // blocam audio user pana termina AI greeting
 
       openAiWs.send(
         JSON.stringify({
@@ -173,15 +198,32 @@ fastify.register(async (f) => {
         return;
       }
 
+      // minimal log
       if (
         msg.type === "session.created" ||
         msg.type === "session.updated" ||
         msg.type === "response.created" ||
         msg.type === "response.done" ||
         msg.type === "input_audio_buffer.committed" ||
+        msg.type === "input_audio_buffer.speech_started" ||
+        msg.type === "input_audio_buffer.speech_stopped" ||
         msg.type === "error"
       ) {
         console.log(`Received event: ${msg.type}`);
+      }
+
+      if (msg.type === "error") {
+        console.error("OPENAI ERROR FULL:", JSON.stringify(msg, null, 2));
+
+        // daca e overlap, nu mai spama cu response.create
+        if (msg?.error?.code === "conversation_already_has_active_response") {
+          responseInFlight = true;
+          pendingResponse = true;
+        } else {
+          // pentru alte erori, permitem retry
+          responseInFlight = false;
+        }
+        return;
       }
 
       if (msg.type === "session.updated") {
@@ -191,15 +233,27 @@ fastify.register(async (f) => {
         return;
       }
 
+      // Mark in-flight as soon as OpenAI confirms
       if (msg.type === "response.created") {
         responseInFlight = true;
         return;
       }
 
+      // ✅ BARGE-IN: user începe să vorbească -> oprim botul și clear în Twilio
+      // IMPORTANT: trebuie să fim în modul "allowUserAudioToOpenAI" ca să fie conversațional.
+      // Dacă încă e greeting, ignorăm (că nu trimitem audio user oricum).
+      if (msg.type === "input_audio_buffer.speech_started") {
+        if (allowUserAudioToOpenAI && responseInFlight) {
+          cancelResponseAndClearTwilio("speech_started");
+        }
+        return;
+      }
+
       // audio delta -> Twilio
       if (msg.type === "response.output_audio.delta" && msg.delta && streamSid) {
-        // daca vezi asta in logs, ai audio streaming OK
-        // console.log("AUDIO_DELTA");
+        if (DEBUG_AUDIO_DELTA) {
+          console.log("AUDIO DELTA len:", msg.delta?.length || 0);
+        }
         connection.send(
           JSON.stringify({
             event: "media",
@@ -213,10 +267,7 @@ fastify.register(async (f) => {
       if (msg.type === "response.done") {
         responseInFlight = false;
 
-        // log FULL ca sa intelegi statusul
-        console.log("RESPONSE.DONE FULL:", JSON.stringify(msg, null, 2));
-
-        // daca greeting-ul s-a terminat (chiar si partial), permitem audio user
+        // daca greeting-ul s-a terminat, permitem audio user
         if (greetingInProgress && !greetingDone) {
           greetingDone = true;
           greetingInProgress = false;
@@ -232,7 +283,7 @@ fastify.register(async (f) => {
           );
         }
 
-        // daca era ceva pending, il pornim dupa ce s-a terminat
+        // dacă aveam ceva pending (user a vorbit între timp), pornim acum
         if (pendingResponse) {
           createResponse("pending_after_done");
         }
@@ -243,22 +294,8 @@ fastify.register(async (f) => {
         // cerem raspuns DOAR dupa ce greeting-ul e gata si user audio e permis
         if (!allowUserAudioToOpenAI) return;
 
-        // marcăm că vrem un răspuns, dar îl pornim doar dacă nu e altul în flight
         pendingResponse = true;
         if (!responseInFlight) createResponse("vad_committed");
-        return;
-      }
-
-      if (msg.type === "error") {
-        console.error("OPENAI ERROR FULL:", JSON.stringify(msg, null, 2));
-
-        // daca zice ca exista deja response activ, nu mai spama
-        if (msg?.error?.code === "conversation_already_has_active_response") {
-          responseInFlight = true;
-          pendingResponse = true;
-        } else {
-          responseInFlight = false;
-        }
         return;
       }
     });
