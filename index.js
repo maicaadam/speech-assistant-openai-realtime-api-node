@@ -47,7 +47,7 @@ fastify.addHook("onRequest", async (req) => {
 fastify.get("/", async () => ({ ok: true }));
 fastify.get("/health", async (_req, reply) => reply.code(200).send("ok"));
 
-// Twilio webhook: fara Say (fara mesaj Twilio)
+// Twilio webhook: fara mesaj Twilio (fara <Say>)
 fastify.all("/incoming-call", async (request, reply) => {
   const wsBase = (PUBLIC_URL ? PUBLIC_URL : `https://${request.headers.host}`)
     .replace(/^http:\/\//, "ws://")
@@ -78,21 +78,12 @@ fastify.register(async (f) => {
     let responseInFlight = false;
     let pendingResponse = false;
 
-    let lastDoneAt = 0;
-    let lastCreateAt = 0;
-
-    // ignore early VAD commits
-    const callStartAt = Date.now();
-    const IGNORE_COMMITTED_MS = 1200;
-
-    const SAFE_GAP_AFTER_DONE_MS = 900;
-    const MIN_GAP_BETWEEN_CREATE_MS = 700;
-
-    // Greeting
-    let greetingSent = false;
+    // IMPORTANT: pana termina AI greeting-ul, NU trimitem audio user catre OpenAI
+    let allowUserAudioToOpenAI = false;
+    let greetingInProgress = false;
+    let greetingDone = false;
 
     const openAiWs = new WebSocket(
-      // IMPORTANT: daca model-ul asta nu iti da audio, aici e primul loc unde schimbi
       `wss://api.openai.com/v1/realtime?model=gpt-realtime`,
       {
         headers: {
@@ -103,7 +94,6 @@ fastify.register(async (f) => {
     );
 
     const sendSessionUpdate = () => {
-      // folosim schema acceptata de tine (ai session.updated OK)
       const payload = {
         type: "session.update",
         session: {
@@ -111,6 +101,8 @@ fastify.register(async (f) => {
           temperature: TEMPERATURE,
           voice: VOICE,
           turn_detection: { type: "server_vad" },
+
+          // Twilio Media Streams = G.711 u-law
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
         },
@@ -120,9 +112,30 @@ fastify.register(async (f) => {
       openAiWs.send(JSON.stringify(payload));
     };
 
+    const createResponse = (reason) => {
+      if (!openAiReady || !sessionUpdated || !streamSid) return;
+      if (responseInFlight) return;
+
+      responseInFlight = true;
+      pendingResponse = false;
+
+      console.log(`Sending response.create (${reason})`);
+      openAiWs.send(
+        JSON.stringify({
+          type: "response.create",
+          response: {
+            modalities: ["audio", "text"],
+            temperature: TEMPERATURE,
+          },
+        })
+      );
+    };
+
     const sendGreeting = () => {
-      if (greetingSent) return;
-      greetingSent = true;
+      if (greetingInProgress || greetingDone) return;
+
+      greetingInProgress = true;
+      allowUserAudioToOpenAI = false; // blocam audio user pana termina AI
 
       openAiWs.send(
         JSON.stringify({
@@ -142,40 +155,8 @@ fastify.register(async (f) => {
         })
       );
 
-      pendingResponse = true; // pump will create response safely
+      createResponse("greeting");
     };
-
-    const tryCreateResponse = (reason) => {
-      const now = Date.now();
-
-      if (!openAiReady || !sessionUpdated || !streamSid) return;
-      if (responseInFlight) return;
-
-      if (now - lastDoneAt < SAFE_GAP_AFTER_DONE_MS) return;
-      if (now - lastCreateAt < MIN_GAP_BETWEEN_CREATE_MS) return;
-
-      lastCreateAt = now;
-      responseInFlight = true; // optimistic guard
-      pendingResponse = false;
-
-      console.log(`Sending response.create (${reason})`);
-
-      // IMPORTANT: nu trimitem campuri extra (sa nu rupa schema)
-      openAiWs.send(
-        JSON.stringify({
-          type: "response.create",
-          response: {
-            modalities: ["audio", "text"],
-            temperature: TEMPERATURE,
-          },
-        })
-      );
-    };
-
-    // Pump: singurul loc care trimite response.create
-    const pump = setInterval(() => {
-      if (pendingResponse) tryCreateResponse("pump_pending");
-    }, 200);
 
     // --- OpenAI events ---
     openAiWs.on("open", () => {
@@ -192,15 +173,12 @@ fastify.register(async (f) => {
         return;
       }
 
-      // Log minim dar util
       if (
         msg.type === "session.created" ||
         msg.type === "session.updated" ||
         msg.type === "response.created" ||
         msg.type === "response.done" ||
         msg.type === "input_audio_buffer.committed" ||
-        msg.type === "response.output_text.delta" ||
-        msg.type === "response.output_text.done" ||
         msg.type === "error"
       ) {
         console.log(`Received event: ${msg.type}`);
@@ -218,8 +196,10 @@ fastify.register(async (f) => {
         return;
       }
 
+      // audio delta -> Twilio
       if (msg.type === "response.output_audio.delta" && msg.delta && streamSid) {
-        console.log("AUDIO_DELTA");
+        // daca vezi asta in logs, ai audio streaming OK
+        // console.log("AUDIO_DELTA");
         connection.send(
           JSON.stringify({
             event: "media",
@@ -230,37 +210,49 @@ fastify.register(async (f) => {
         return;
       }
 
-      if (msg.type === "response.output_text.delta" && msg.delta) {
-        // vezi daca macar text vine
-        process.stdout.write(msg.delta);
-        return;
-      }
-
-      if (msg.type === "response.output_text.done") {
-        process.stdout.write("\n");
-        return;
-      }
-
       if (msg.type === "response.done") {
-        lastDoneAt = Date.now();
         responseInFlight = false;
 
-        // log FULL ca sa vezi status/output
+        // log FULL ca sa intelegi statusul
         console.log("RESPONSE.DONE FULL:", JSON.stringify(msg, null, 2));
 
+        // daca greeting-ul s-a terminat (chiar si partial), permitem audio user
+        if (greetingInProgress && !greetingDone) {
+          greetingDone = true;
+          greetingInProgress = false;
+          allowUserAudioToOpenAI = true;
+          console.log("Greeting finished. User audio is now enabled.");
+        }
+
+        // daca a esuat, log detaliat
+        if (msg.response?.status === "failed") {
+          console.error(
+            "OPENAI FAILED DETAILS:",
+            JSON.stringify(msg.response?.status_details, null, 2)
+          );
+        }
+
+        // daca era ceva pending, il pornim dupa ce s-a terminat
+        if (pendingResponse) {
+          createResponse("pending_after_done");
+        }
         return;
       }
 
       if (msg.type === "input_audio_buffer.committed") {
-        if (Date.now() - callStartAt < IGNORE_COMMITTED_MS) return;
+        // cerem raspuns DOAR dupa ce greeting-ul e gata si user audio e permis
+        if (!allowUserAudioToOpenAI) return;
+
+        // marcăm că vrem un răspuns, dar îl pornim doar dacă nu e altul în flight
         pendingResponse = true;
+        if (!responseInFlight) createResponse("vad_committed");
         return;
       }
 
       if (msg.type === "error") {
         console.error("OPENAI ERROR FULL:", JSON.stringify(msg, null, 2));
 
-        // daca server zice ca e deja active response, NU mai spama; asteapta done
+        // daca zice ca exista deja response activ, nu mai spama
         if (msg?.error?.code === "conversation_already_has_active_response") {
           responseInFlight = true;
           pendingResponse = true;
@@ -277,6 +269,9 @@ fastify.register(async (f) => {
       sessionUpdated = false;
       responseInFlight = false;
       pendingResponse = false;
+      allowUserAudioToOpenAI = false;
+      greetingInProgress = false;
+      greetingDone = false;
     });
 
     openAiWs.on("error", (err) => {
@@ -300,6 +295,9 @@ fastify.register(async (f) => {
           break;
 
         case "media":
+          // IMPORTANT: in timpul greeting-ului, IGNORAM audio user ca sa nu declanseze turn_detected
+          if (!allowUserAudioToOpenAI) return;
+
           if (openAiWs.readyState === WebSocket.OPEN) {
             openAiWs.send(
               JSON.stringify({
@@ -321,7 +319,6 @@ fastify.register(async (f) => {
 
     connection.on("close", () => {
       console.log("Client disconnected (Twilio WS)");
-      clearInterval(pump);
       try {
         if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
       } catch {}
