@@ -16,24 +16,32 @@ const fastify = Fastify({ logger: false });
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
-const AGENCY_NAME = process.env.AGENCY_NAME || "Agentia X";
 const PORT = Number(process.env.PORT || 8080);
 
 const SYSTEM_MESSAGE = `
-E�ti un agent virtual telefonic pentru o agenție imobiliară din România: ${AGENCY_NAME}.
-Vorbești DOAR în limba română, politicos, clar, concis.
+E�ti agentul virtual al companiei imobiliare Union Group din România.
+Vorbești DOAR în limba română, politicos, cald și profesionist.
+
+SALUT OBLIGATORIU la început:
+"Bună ziua, sunt agentul virtual al companiei imobiliare Union Group. Vă rog să îmi spuneți pentru ce proprietate ați sunat și îi voi transmite agentului responsabil."
 
 Scopul tău este:
-1) să afli pentru ce proprietate sună clientul (cod anunț / link / adresă / cartier / tip proprietate),
-2) să preiei date de contact (nume + număr de telefon dacă e diferit de cel de apel),
-3) să întrebi 2-3 detalii utile (buget, când ar vrea vizionare, cerințe),
-4) să anunți că un agent uman va reveni în maxim o oră.
+1) Află proprietatea pentru care sună clientul (cod anunț / adresă / cartier / tip).
+2) Dacă clientul întreabă detalii despre o proprietate (ex: are centrală?, câte camere?, preț?), caută pe site-ul https://www.uniongroup.ro/vanzari și oferă informațiile găsite. Dacă nu găsești, spune sincer că vei transmite întrebarea agentului.
+3) Preia numele clientului.
+4) Întreabă când ar dori vizionarea și dacă are cerințe speciale.
+5) Încheie cu: "Mulțumesc! Agentul asignat vă va suna cât mai rapid. O zi frumoasă!"
 
 Reguli:
-- Nu promite lucruri sigure despre proprietate dacă nu știi.
-- Dacă clientul nu știe codul anunțului, întreabă: oraș, zonă/cartier, tip, nr camere, buget.
-- Fii scurt: 1 întrebare o dată.
-- La final, confirmă informațiile și încheie politicos.
+- O întrebare o dată, nu îngrămădi.
+- Nu inventa informații despre proprietăți.
+- Fii scurt și natural, ca un om.
+- La finalul apelului, înainte de a închide, generează un REZUMAT și afișează-l cu prefixul exact [REZUMAT APEL] astfel:
+  [REZUMAT APEL]
+  Proprietate: ...
+  Client: ...
+  Cerințe/Întrebări: ...
+  Disponibilitate vizionare: ...
 `.trim();
 
 const VOICE = "alloy";
@@ -70,7 +78,9 @@ fastify.register(async (f) => {
     let sessionUpdated = false;
     let responseInFlight = false;
 
-    // ✅ FIX: model fără dată hardcodată
+    // Buffer pentru transcript - ca sa putem loga rezumatul
+    let fullTranscript = "";
+
     const openAiWs = new WebSocket(
       `wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview`,
       {
@@ -81,7 +91,6 @@ fastify.register(async (f) => {
       }
     );
 
-    // ✅ FIX: structură corectă session.update
     const sendSessionUpdate = () => {
       const payload = {
         type: "session.update",
@@ -92,6 +101,8 @@ fastify.register(async (f) => {
           temperature: TEMPERATURE,
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
+          // Activam transcriptul pentru input audio
+          input_audio_transcription: { model: "whisper-1" },
           turn_detection: {
             type: "server_vad",
             threshold: 0.5,
@@ -116,9 +127,7 @@ fastify.register(async (f) => {
             content: [
               {
                 type: "input_text",
-                text:
-                  `Bună ziua! Ați sunat la ${AGENCY_NAME}. ` +
-                  `Cu ce vă pot ajuta? Dacă aveți codul anunțului sau un link, vă rog să îmi spuneți.`,
+                text: "Saluta clientul conform instructiunilor.",
               },
             ],
           },
@@ -133,12 +142,7 @@ fastify.register(async (f) => {
       );
     };
 
-    // ✅ FIX: eliminat output_audio_buffer.clear care nu există în API
     const bargeIn = () => {
-      if (!responseInFlight) return;
-      try {
-        openAiWs.send(JSON.stringify({ type: "response.cancel" }));
-      } catch {}
       if (streamSid) {
         connection.send(JSON.stringify({ event: "clear", streamSid }));
       }
@@ -178,6 +182,7 @@ fastify.register(async (f) => {
         return;
       }
 
+      // Audio -> Twilio
       if (msg.type === "response.audio.delta" && msg.delta && streamSid) {
         connection.send(
           JSON.stringify({
@@ -186,6 +191,35 @@ fastify.register(async (f) => {
             media: { payload: msg.delta },
           })
         );
+        return;
+      }
+
+      // Colectam transcriptul botului
+      if (msg.type === "response.audio_transcript.delta" && msg.delta) {
+        fullTranscript += msg.delta;
+        return;
+      }
+
+      // Colectam transcriptul userului
+      if (
+        msg.type === "conversation.item.input_audio_transcription.completed" &&
+        msg.transcript
+      ) {
+        console.log(`[USER] ${msg.transcript}`);
+        fullTranscript += `\nClient: ${msg.transcript}\n`;
+        return;
+      }
+
+      // La sfarsitul fiecarui raspuns al botului, adaugam linie noua
+      if (msg.type === "response.audio_transcript.done" && msg.transcript) {
+        console.log(`[BOT] ${msg.transcript}`);
+
+        // Daca transcriptul contine rezumatul, il logam special
+        if (msg.transcript.includes("[REZUMAT APEL]")) {
+          console.log("\n=============================");
+          console.log(msg.transcript);
+          console.log("=============================\n");
+        }
         return;
       }
 
@@ -213,6 +247,12 @@ fastify.register(async (f) => {
 
     openAiWs.on("close", () => {
       console.log("Disconnected from OpenAI Realtime WS");
+      // La inchiderea conexiunii, logam tot transcriptul
+      if (fullTranscript) {
+        console.log("\n===== TRANSCRIPT COMPLET =====");
+        console.log(fullTranscript);
+        console.log("==============================\n");
+      }
       openAiReady = false;
       sessionUpdated = false;
       responseInFlight = false;
