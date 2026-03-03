@@ -74,7 +74,7 @@ fastify.register(async (f) => {
     let responseInFlight = false;
 
     const openAiWs = new WebSocket(
-      `wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01`,
+      `wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview`,
       {
         headers: {
           Authorization: `Bearer ${OPENAI_API_KEY}`,
